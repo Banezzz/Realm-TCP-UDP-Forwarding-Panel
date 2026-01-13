@@ -1,4 +1,4 @@
-````markdown
+
 # Realm TCP/UDP Forwarding Panel
 
 一个功能强大的 **Realm 端口转发管理脚本**，支持一键部署、规则管理、中国网络优化等功能。
@@ -181,5 +181,3 @@ journalctl -u realm -n 50
 
 **MIT License**
 
-```
-```
