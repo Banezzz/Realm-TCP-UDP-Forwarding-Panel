@@ -812,6 +812,250 @@ manage_cron() {
     esac
 }
 
+# ========================================
+# 配置导入导出
+# ========================================
+export_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}✖ 配置文件不存在，请先安装 Realm 并添加规则${NC}"
+        return
+    fi
+
+    echo -e "\n${YELLOW}配置导出方式：${NC}"
+    echo "1. 导出到文件"
+    echo "2. 导出为 Base64 字符串（方便跨服务器复制粘贴）"
+    echo "0. 返回"
+    echo -e ""
+    read -rp "请选择: " choice
+
+    case $choice in
+        1)
+            local default_path="/root/realm_config_backup.toml"
+            echo -e ""
+            echo -e "${BLUE}请输入导出文件路径（直接回车使用默认路径）${NC}"
+            echo -e "${CYAN}默认路径: ${default_path}${NC}"
+            echo -e ""
+            read -rp "导出路径: " export_path
+            export_path=${export_path:-$default_path}
+
+            # 确保目标目录存在
+            local export_dir
+            export_dir=$(dirname "$export_path")
+            if [[ ! -d "$export_dir" ]]; then
+                echo -e "${RED}✖ 目录不存在: ${export_dir}${NC}"
+                return
+            fi
+
+            if cp "$CONFIG_FILE" "$export_path"; then
+                log "配置已导出到 $export_path"
+                echo -e "${GREEN}✔ 配置已成功导出到: ${export_path}${NC}"
+                echo -e ""
+                echo -e "${CYAN}提示: 可使用 scp 将文件传输到其他服务器${NC}"
+                echo -e "${CYAN}示例: scp ${export_path} root@目标IP:/root/${NC}"
+            else
+                echo -e "${RED}✖ 导出失败，请检查路径和权限${NC}"
+            fi
+            ;;
+        2)
+            echo -e ""
+            echo -e "${BLUE}▶ 正在生成 Base64 编码...${NC}"
+            echo -e ""
+            echo -e "${YELLOW}═══════════ 配置内容（Base64）开始 ═══════════${NC}"
+            base64 -w 0 "$CONFIG_FILE"
+            echo ""
+            echo -e "${YELLOW}═══════════ 配置内容（Base64）结束 ═══════════${NC}"
+            echo -e ""
+            echo -e "${CYAN}提示: 复制上面两行标记之间的内容，在目标服务器上使用「导入配置」功能粘贴即可${NC}"
+            log "配置已导出为 Base64"
+            ;;
+        0|*)
+            return
+            ;;
+    esac
+}
+
+import_config() {
+    echo -e "\n${YELLOW}配置导入方式：${NC}"
+    echo "1. 从文件导入"
+    echo "2. 从 Base64 字符串导入（粘贴）"
+    echo "0. 返回"
+    echo -e ""
+    read -rp "请选择: " choice
+
+    case $choice in
+        1)
+            local default_path="/root/realm_config_backup.toml"
+            echo -e ""
+            echo -e "${BLUE}请输入配置文件路径（直接回车使用默认路径）${NC}"
+            echo -e "${CYAN}默认路径: ${default_path}${NC}"
+            echo -e ""
+            read -rp "文件路径: " import_path
+            import_path=${import_path:-$default_path}
+
+            if [[ ! -f "$import_path" ]]; then
+                echo -e "${RED}✖ 文件不存在: ${import_path}${NC}"
+                return
+            fi
+
+            # 验证配置文件格式
+            if ! grep -q '\[network\]' "$import_path"; then
+                echo -e "${RED}✖ 无效的配置文件：缺少 [network] 段${NC}"
+                return
+            fi
+
+            # 显示将要导入的规则
+            echo -e ""
+            echo -e "${BLUE}▶ 将要导入的配置内容：${NC}"
+            echo -e "${CYAN}─────────────────────────────────────${NC}"
+            cat "$import_path"
+            echo -e "${CYAN}─────────────────────────────────────${NC}"
+
+            local rule_count
+            rule_count=$(grep -c '^\[\[endpoints\]\]' "$import_path" 2>/dev/null || echo "0")
+            echo -e "${BLUE}包含 ${rule_count} 条转发规则${NC}"
+            echo -e ""
+
+            echo -e "${YELLOW}⚠ 导入将覆盖当前所有配置！${NC}"
+            read -rp "确认导入？(y/N): " confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                echo "已取消导入。"
+                return
+            fi
+
+            # 备份当前配置
+            if [[ -f "$CONFIG_FILE" ]]; then
+                local backup_path="${CONFIG_FILE}.bak.$(date '+%Y%m%d%H%M%S')"
+                cp "$CONFIG_FILE" "$backup_path"
+                echo -e "${GREEN}✓ 当前配置已备份到: ${backup_path}${NC}"
+            fi
+
+            # 导入配置
+            if cp "$import_path" "$CONFIG_FILE"; then
+                log "配置已从 $import_path 导入（${rule_count} 条规则）"
+                echo -e "${GREEN}✔ 配置导入成功！${NC}"
+
+                # 询问是否重启服务
+                if systemctl is-active --quiet realm 2>/dev/null; then
+                    read -rp "是否立即重启服务使配置生效？(Y/n): " restart_choice
+                    restart_choice=${restart_choice:-Y}
+                    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
+                        systemctl restart realm.service
+                        echo -e "${GREEN}✔ 服务已重启，新配置已生效${NC}"
+                    else
+                        echo -e "${YELLOW}▶ 请稍后手动重启服务使配置生效${NC}"
+                    fi
+                fi
+            else
+                echo -e "${RED}✖ 导入失败，请检查权限${NC}"
+            fi
+            ;;
+        2)
+            echo -e ""
+            echo -e "${BLUE}请粘贴 Base64 编码的配置内容（单行），然后按回车：${NC}"
+            echo -e ""
+            read -rp "Base64: " base64_input
+
+            if [[ -z "$base64_input" ]]; then
+                echo -e "${RED}✖ 未输入内容${NC}"
+                return
+            fi
+
+            # 解码 Base64
+            local decoded
+            decoded=$(echo "$base64_input" | base64 -d 2>/dev/null)
+            if [[ $? -ne 0 || -z "$decoded" ]]; then
+                echo -e "${RED}✖ Base64 解码失败，请检查输入内容是否完整${NC}"
+                return
+            fi
+
+            # 验证配置格式
+            if ! echo "$decoded" | grep -q '\[network\]'; then
+                echo -e "${RED}✖ 无效的配置内容：缺少 [network] 段${NC}"
+                return
+            fi
+
+            # 显示解码后的内容
+            echo -e ""
+            echo -e "${BLUE}▶ 解码后的配置内容：${NC}"
+            echo -e "${CYAN}─────────────────────────────────────${NC}"
+            echo "$decoded"
+            echo -e "${CYAN}─────────────────────────────────────${NC}"
+
+            local rule_count
+            rule_count=$(echo "$decoded" | grep -c '^\[\[endpoints\]\]' 2>/dev/null || echo "0")
+            echo -e "${BLUE}包含 ${rule_count} 条转发规则${NC}"
+            echo -e ""
+
+            echo -e "${YELLOW}⚠ 导入将覆盖当前所有配置！${NC}"
+            read -rp "确认导入？(y/N): " confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                echo "已取消导入。"
+                return
+            fi
+
+            # 确保目录存在
+            mkdir -p "$REALM_DIR"
+
+            # 备份当前配置
+            if [[ -f "$CONFIG_FILE" ]]; then
+                local backup_path="${CONFIG_FILE}.bak.$(date '+%Y%m%d%H%M%S')"
+                cp "$CONFIG_FILE" "$backup_path"
+                echo -e "${GREEN}✓ 当前配置已备份到: ${backup_path}${NC}"
+            fi
+
+            # 写入配置
+            if echo "$decoded" > "$CONFIG_FILE"; then
+                log "配置已从 Base64 导入（${rule_count} 条规则）"
+                echo -e "${GREEN}✔ 配置导入成功！${NC}"
+
+                # 询问是否重启服务
+                if systemctl is-active --quiet realm 2>/dev/null; then
+                    read -rp "是否立即重启服务使配置生效？(Y/n): " restart_choice
+                    restart_choice=${restart_choice:-Y}
+                    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
+                        systemctl restart realm.service
+                        echo -e "${GREEN}✔ 服务已重启，新配置已生效${NC}"
+                    else
+                        echo -e "${YELLOW}▶ 请稍后手动重启服务使配置生效${NC}"
+                    fi
+                fi
+            else
+                echo -e "${RED}✖ 写入配置文件失败${NC}"
+            fi
+            ;;
+        0|*)
+            return
+            ;;
+    esac
+}
+
+manage_config() {
+    echo -e "\n${YELLOW}配置管理：${NC}"
+    echo -e ""
+
+    # 显示当前配置状态
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local rule_count
+        rule_count=$(grep -c '^\[\[endpoints\]\]' "$CONFIG_FILE" 2>/dev/null || echo "0")
+        echo -e "当前配置: ${GREEN}${CONFIG_FILE}${NC} (${rule_count} 条规则)"
+    else
+        echo -e "当前配置: ${YELLOW}不存在${NC}"
+    fi
+
+    echo -e ""
+    echo "1. 导出配置"
+    echo "2. 导入配置"
+    echo "0. 返回主菜单"
+    echo -e ""
+    read -rp "请选择: " choice
+
+    case $choice in
+        1) export_config ;;
+        2) import_config ;;
+        0|*) return ;;
+    esac
+}
+
 uninstall() {
     log "开始卸载"
     echo -e "${YELLOW}▶ 正在卸载...${NC}"
@@ -935,6 +1179,7 @@ main_menu() {
         echo -e "${BLUE}    ├──────────────────────────────────────────┤${NC}"
         echo -e "${BLUE}    │${NC}  ${RED}[10]${NC} 🗑  完全卸载                          ${BLUE}│${NC}"
         echo -e "${BLUE}    │${NC}  ${YELLOW}[11]${NC} 🌐 代理设置                          ${BLUE}│${NC}"
+        echo -e "${BLUE}    │${NC}  ${YELLOW}[12]${NC} 📦 配置导入导出                      ${BLUE}│${NC}"
         echo -e "${BLUE}    ├──────────────────────────────────────────┤${NC}"
         echo -e "${BLUE}    │${NC}  ${CYAN}[0]${NC}  ✖  退出脚本                           ${BLUE}│${NC}"
         echo -e "${BLUE}    └──────────────────────────────────────────┘${NC}"
@@ -964,6 +1209,7 @@ main_menu() {
                 fi
                 ;;
             11) manage_proxy ;;
+            12) manage_config ;;
             0) exit 0
             ;;
             *) echo -e "${RED}无效选项！${NC}" ;;
