@@ -831,7 +831,15 @@ apply_imported_config() {
         if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
             systemctl daemon-reload
             systemctl restart realm.service
-            echo -e "${GREEN}✔ 服务已重启，新配置已生效${NC}"
+            # 等待并验证服务是否成功启动
+            sleep 1
+            if systemctl is-active --quiet realm 2>/dev/null; then
+                echo -e "${GREEN}✔ 服务已重启，新配置已生效${NC}"
+            else
+                echo -e "${RED}✖ 服务重启后异常退出，配置可能存在错误${NC}"
+                echo -e "${YELLOW}  请检查配置文件格式，或使用备份恢复：${NC}"
+                echo -e "${CYAN}  ls ${CONFIG_FILE}.bak.*${NC}"
+            fi
         else
             echo -e "${YELLOW}▶ 请稍后手动重启服务使配置生效${NC}"
         fi
@@ -844,7 +852,15 @@ apply_imported_config() {
             systemctl daemon-reload
             systemctl restart realm.service
             systemctl enable realm.service
-            echo -e "${GREEN}✔ 服务已启动，配置已生效${NC}"
+            # 等待并验证服务是否成功启动
+            sleep 1
+            if systemctl is-active --quiet realm 2>/dev/null; then
+                echo -e "${GREEN}✔ 服务已启动，配置已生效${NC}"
+            else
+                echo -e "${RED}✖ 服务启动后异常退出，配置可能存在错误${NC}"
+                echo -e "${YELLOW}  请检查配置文件格式，或使用备份恢复：${NC}"
+                echo -e "${CYAN}  ls ${CONFIG_FILE}.bak.*${NC}"
+            fi
         else
             echo -e "${YELLOW}▶ 请稍后通过菜单选项 [5] 启动服务${NC}"
         fi
@@ -957,6 +973,9 @@ import_config() {
                 echo "已取消导入。"
                 return
             fi
+
+            # 确保目录存在
+            mkdir -p "$REALM_DIR"
 
             # 备份当前配置
             if [[ -f "$CONFIG_FILE" ]]; then
