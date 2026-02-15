@@ -815,6 +815,58 @@ manage_cron() {
 # ========================================
 # 配置导入导出
 # ========================================
+# 导入后应用配置到 realm 服务
+apply_imported_config() {
+    # 检查 realm 是否已安装
+    if [[ ! -x "$REALM_DIR/realm" || ! -f "$SERVICE_FILE" ]]; then
+        echo -e "${YELLOW}⚠ Realm 尚未安装，请先通过菜单选项 [1] 安装 Realm${NC}"
+        echo -e "${CYAN}  安装后配置将自动生效（已导入的配置文件会被保留）${NC}"
+        return
+    fi
+
+    if systemctl is-active --quiet realm 2>/dev/null; then
+        # 服务正在运行 → 需要重启才能加载新配置
+        read -rp "是否立即重启服务使配置生效？(Y/n): " restart_choice
+        restart_choice=${restart_choice:-Y}
+        if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
+            systemctl daemon-reload
+            systemctl restart realm.service
+            # 等待并验证服务是否成功启动
+            sleep 1
+            if systemctl is-active --quiet realm 2>/dev/null; then
+                echo -e "${GREEN}✔ 服务已重启，新配置已生效${NC}"
+            else
+                echo -e "${RED}✖ 服务重启后异常退出，配置可能存在错误${NC}"
+                echo -e "${YELLOW}  请检查配置文件格式，或使用备份恢复：${NC}"
+                echo -e "${CYAN}  ls ${CONFIG_FILE}.bak.*${NC}"
+            fi
+        else
+            echo -e "${YELLOW}▶ 请稍后手动重启服务使配置生效${NC}"
+        fi
+    else
+        # 服务未运行 → 需要启动
+        read -rp "Realm 服务当前未运行，是否立即启动？(Y/n): " start_choice
+        start_choice=${start_choice:-Y}
+        if [[ "$start_choice" =~ ^[Yy]$ ]]; then
+            systemctl unmask realm.service
+            systemctl daemon-reload
+            systemctl restart realm.service
+            systemctl enable realm.service
+            # 等待并验证服务是否成功启动
+            sleep 1
+            if systemctl is-active --quiet realm 2>/dev/null; then
+                echo -e "${GREEN}✔ 服务已启动，配置已生效${NC}"
+            else
+                echo -e "${RED}✖ 服务启动后异常退出，配置可能存在错误${NC}"
+                echo -e "${YELLOW}  请检查配置文件格式，或使用备份恢复：${NC}"
+                echo -e "${CYAN}  ls ${CONFIG_FILE}.bak.*${NC}"
+            fi
+        else
+            echo -e "${YELLOW}▶ 请稍后通过菜单选项 [5] 启动服务${NC}"
+        fi
+    fi
+}
+
 export_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         echo -e "${RED}✖ 配置文件不存在，请先安装 Realm 并添加规则${NC}"
@@ -922,6 +974,9 @@ import_config() {
                 return
             fi
 
+            # 确保目录存在
+            mkdir -p "$REALM_DIR"
+
             # 备份当前配置
             if [[ -f "$CONFIG_FILE" ]]; then
                 local backup_path="${CONFIG_FILE}.bak.$(date '+%Y%m%d%H%M%S')"
@@ -933,18 +988,7 @@ import_config() {
             if cp "$import_path" "$CONFIG_FILE"; then
                 log "配置已从 $import_path 导入（${rule_count} 条规则）"
                 echo -e "${GREEN}✔ 配置导入成功！${NC}"
-
-                # 询问是否重启服务
-                if systemctl is-active --quiet realm 2>/dev/null; then
-                    read -rp "是否立即重启服务使配置生效？(Y/n): " restart_choice
-                    restart_choice=${restart_choice:-Y}
-                    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
-                        systemctl restart realm.service
-                        echo -e "${GREEN}✔ 服务已重启，新配置已生效${NC}"
-                    else
-                        echo -e "${YELLOW}▶ 请稍后手动重启服务使配置生效${NC}"
-                    fi
-                fi
+                apply_imported_config
             else
                 echo -e "${RED}✖ 导入失败，请检查权限${NC}"
             fi
@@ -960,17 +1004,27 @@ import_config() {
                 return
             fi
 
-            # 解码 Base64
-            local decoded
-            decoded=$(echo "$base64_input" | base64 -d 2>/dev/null)
-            if [[ $? -ne 0 || -z "$decoded" ]]; then
+            # 解码 Base64 直接到临时文件（避免 echo/变量导致内容损坏）
+            local tmp_file
+            tmp_file=$(mktemp /tmp/realm_import.XXXXXX)
+
+            if ! printf '%s' "$base64_input" | base64 -d > "$tmp_file" 2>/dev/null; then
                 echo -e "${RED}✖ Base64 解码失败，请检查输入内容是否完整${NC}"
+                rm -f "$tmp_file"
+                return
+            fi
+
+            # 检查解码结果是否为空
+            if [[ ! -s "$tmp_file" ]]; then
+                echo -e "${RED}✖ Base64 解码结果为空，请检查输入${NC}"
+                rm -f "$tmp_file"
                 return
             fi
 
             # 验证配置格式
-            if ! echo "$decoded" | grep -q '\[network\]'; then
+            if ! grep -q '\[network\]' "$tmp_file"; then
                 echo -e "${RED}✖ 无效的配置内容：缺少 [network] 段${NC}"
+                rm -f "$tmp_file"
                 return
             fi
 
@@ -978,11 +1032,11 @@ import_config() {
             echo -e ""
             echo -e "${BLUE}▶ 解码后的配置内容：${NC}"
             echo -e "${CYAN}─────────────────────────────────────${NC}"
-            echo "$decoded"
+            cat "$tmp_file"
             echo -e "${CYAN}─────────────────────────────────────${NC}"
 
             local rule_count
-            rule_count=$(echo "$decoded" | grep -c '^\[\[endpoints\]\]' 2>/dev/null || echo "0")
+            rule_count=$(grep -c '^\[\[endpoints\]\]' "$tmp_file" 2>/dev/null || echo "0")
             echo -e "${BLUE}包含 ${rule_count} 条转发规则${NC}"
             echo -e ""
 
@@ -990,6 +1044,7 @@ import_config() {
             read -rp "确认导入？(y/N): " confirm
             if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
                 echo "已取消导入。"
+                rm -f "$tmp_file"
                 return
             fi
 
@@ -1003,25 +1058,15 @@ import_config() {
                 echo -e "${GREEN}✓ 当前配置已备份到: ${backup_path}${NC}"
             fi
 
-            # 写入配置
-            if echo "$decoded" > "$CONFIG_FILE"; then
+            # 写入配置（从临时文件复制，确保内容完整无损）
+            if cp "$tmp_file" "$CONFIG_FILE"; then
                 log "配置已从 Base64 导入（${rule_count} 条规则）"
                 echo -e "${GREEN}✔ 配置导入成功！${NC}"
-
-                # 询问是否重启服务
-                if systemctl is-active --quiet realm 2>/dev/null; then
-                    read -rp "是否立即重启服务使配置生效？(Y/n): " restart_choice
-                    restart_choice=${restart_choice:-Y}
-                    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
-                        systemctl restart realm.service
-                        echo -e "${GREEN}✔ 服务已重启，新配置已生效${NC}"
-                    else
-                        echo -e "${YELLOW}▶ 请稍后手动重启服务使配置生效${NC}"
-                    fi
-                fi
+                apply_imported_config
             else
                 echo -e "${RED}✖ 写入配置文件失败${NC}"
             fi
+            rm -f "$tmp_file"
             ;;
         0|*)
             return
