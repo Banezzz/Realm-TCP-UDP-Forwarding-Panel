@@ -960,17 +960,27 @@ import_config() {
                 return
             fi
 
-            # 解码 Base64
-            local decoded
-            decoded=$(echo "$base64_input" | base64 -d 2>/dev/null)
-            if [[ $? -ne 0 || -z "$decoded" ]]; then
+            # 解码 Base64 直接到临时文件（避免 echo/变量导致内容损坏）
+            local tmp_file
+            tmp_file=$(mktemp /tmp/realm_import.XXXXXX)
+
+            if ! printf '%s' "$base64_input" | base64 -d > "$tmp_file" 2>/dev/null; then
                 echo -e "${RED}✖ Base64 解码失败，请检查输入内容是否完整${NC}"
+                rm -f "$tmp_file"
+                return
+            fi
+
+            # 检查解码结果是否为空
+            if [[ ! -s "$tmp_file" ]]; then
+                echo -e "${RED}✖ Base64 解码结果为空，请检查输入${NC}"
+                rm -f "$tmp_file"
                 return
             fi
 
             # 验证配置格式
-            if ! echo "$decoded" | grep -q '\[network\]'; then
+            if ! grep -q '\[network\]' "$tmp_file"; then
                 echo -e "${RED}✖ 无效的配置内容：缺少 [network] 段${NC}"
+                rm -f "$tmp_file"
                 return
             fi
 
@@ -978,11 +988,11 @@ import_config() {
             echo -e ""
             echo -e "${BLUE}▶ 解码后的配置内容：${NC}"
             echo -e "${CYAN}─────────────────────────────────────${NC}"
-            echo "$decoded"
+            cat "$tmp_file"
             echo -e "${CYAN}─────────────────────────────────────${NC}"
 
             local rule_count
-            rule_count=$(echo "$decoded" | grep -c '^\[\[endpoints\]\]' 2>/dev/null || echo "0")
+            rule_count=$(grep -c '^\[\[endpoints\]\]' "$tmp_file" 2>/dev/null || echo "0")
             echo -e "${BLUE}包含 ${rule_count} 条转发规则${NC}"
             echo -e ""
 
@@ -990,6 +1000,7 @@ import_config() {
             read -rp "确认导入？(y/N): " confirm
             if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
                 echo "已取消导入。"
+                rm -f "$tmp_file"
                 return
             fi
 
@@ -1003,8 +1014,8 @@ import_config() {
                 echo -e "${GREEN}✓ 当前配置已备份到: ${backup_path}${NC}"
             fi
 
-            # 写入配置
-            if echo "$decoded" > "$CONFIG_FILE"; then
+            # 写入配置（从临时文件复制，确保内容完整无损）
+            if cp "$tmp_file" "$CONFIG_FILE"; then
                 log "配置已从 Base64 导入（${rule_count} 条规则）"
                 echo -e "${GREEN}✔ 配置导入成功！${NC}"
 
@@ -1022,6 +1033,7 @@ import_config() {
             else
                 echo -e "${RED}✖ 写入配置文件失败${NC}"
             fi
+            rm -f "$tmp_file"
             ;;
         0|*)
             return
