@@ -815,6 +815,42 @@ manage_cron() {
 # ========================================
 # 配置导入导出
 # ========================================
+# 导入后应用配置到 realm 服务
+apply_imported_config() {
+    # 检查 realm 是否已安装
+    if [[ ! -x "$REALM_DIR/realm" || ! -f "$SERVICE_FILE" ]]; then
+        echo -e "${YELLOW}⚠ Realm 尚未安装，请先通过菜单选项 [1] 安装 Realm${NC}"
+        echo -e "${CYAN}  安装后配置将自动生效（已导入的配置文件会被保留）${NC}"
+        return
+    fi
+
+    if systemctl is-active --quiet realm 2>/dev/null; then
+        # 服务正在运行 → 需要重启才能加载新配置
+        read -rp "是否立即重启服务使配置生效？(Y/n): " restart_choice
+        restart_choice=${restart_choice:-Y}
+        if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
+            systemctl daemon-reload
+            systemctl restart realm.service
+            echo -e "${GREEN}✔ 服务已重启，新配置已生效${NC}"
+        else
+            echo -e "${YELLOW}▶ 请稍后手动重启服务使配置生效${NC}"
+        fi
+    else
+        # 服务未运行 → 需要启动
+        read -rp "Realm 服务当前未运行，是否立即启动？(Y/n): " start_choice
+        start_choice=${start_choice:-Y}
+        if [[ "$start_choice" =~ ^[Yy]$ ]]; then
+            systemctl unmask realm.service
+            systemctl daemon-reload
+            systemctl restart realm.service
+            systemctl enable realm.service
+            echo -e "${GREEN}✔ 服务已启动，配置已生效${NC}"
+        else
+            echo -e "${YELLOW}▶ 请稍后通过菜单选项 [5] 启动服务${NC}"
+        fi
+    fi
+}
+
 export_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         echo -e "${RED}✖ 配置文件不存在，请先安装 Realm 并添加规则${NC}"
@@ -933,18 +969,7 @@ import_config() {
             if cp "$import_path" "$CONFIG_FILE"; then
                 log "配置已从 $import_path 导入（${rule_count} 条规则）"
                 echo -e "${GREEN}✔ 配置导入成功！${NC}"
-
-                # 询问是否重启服务
-                if systemctl is-active --quiet realm 2>/dev/null; then
-                    read -rp "是否立即重启服务使配置生效？(Y/n): " restart_choice
-                    restart_choice=${restart_choice:-Y}
-                    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
-                        systemctl restart realm.service
-                        echo -e "${GREEN}✔ 服务已重启，新配置已生效${NC}"
-                    else
-                        echo -e "${YELLOW}▶ 请稍后手动重启服务使配置生效${NC}"
-                    fi
-                fi
+                apply_imported_config
             else
                 echo -e "${RED}✖ 导入失败，请检查权限${NC}"
             fi
@@ -1018,18 +1043,7 @@ import_config() {
             if cp "$tmp_file" "$CONFIG_FILE"; then
                 log "配置已从 Base64 导入（${rule_count} 条规则）"
                 echo -e "${GREEN}✔ 配置导入成功！${NC}"
-
-                # 询问是否重启服务
-                if systemctl is-active --quiet realm 2>/dev/null; then
-                    read -rp "是否立即重启服务使配置生效？(Y/n): " restart_choice
-                    restart_choice=${restart_choice:-Y}
-                    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
-                        systemctl restart realm.service
-                        echo -e "${GREEN}✔ 服务已重启，新配置已生效${NC}"
-                    else
-                        echo -e "${YELLOW}▶ 请稍后手动重启服务使配置生效${NC}"
-                    fi
-                fi
+                apply_imported_config
             else
                 echo -e "${RED}✖ 写入配置文件失败${NC}"
             fi
