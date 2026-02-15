@@ -3,7 +3,7 @@
 # ========================================
 # 全局配置
 # ========================================
-CURRENT_VERSION="0.2.0"
+CURRENT_VERSION="0.3.0"
 REALM_DIR="/root/realm"
 CONFIG_FILE="$REALM_DIR/config.toml"
 SERVICE_FILE="/etc/systemd/system/realm.service"
@@ -1101,6 +1101,46 @@ manage_config() {
     esac
 }
 
+# ========================================
+# 日志查看
+# ========================================
+view_logs() {
+    echo -e "\n${YELLOW}日志查看：${NC}"
+    echo "1. 脚本管理日志（操作记录）"
+    echo "2. Realm 服务日志（运行/错误日志）"
+    echo "0. 返回"
+    echo -e ""
+    read -rp "请选择: " choice
+
+    case $choice in
+        1)
+            echo -e "\n${BLUE}脚本管理日志（最近 20 条）：${NC}"
+            echo -e "${CYAN}─────────────────────────────────────${NC}"
+            if [[ -f "$LOG_FILE" ]]; then
+                tail -n 20 "$LOG_FILE"
+            else
+                echo -e "${YELLOW}暂无日志记录${NC}"
+            fi
+            echo -e "${CYAN}─────────────────────────────────────${NC}"
+            echo -e "${CYAN}完整日志: ${LOG_FILE}${NC}"
+            ;;
+        2)
+            echo -e "\n${BLUE}Realm 服务日志（最近 50 条）：${NC}"
+            echo -e "${CYAN}─────────────────────────────────────${NC}"
+            if systemctl list-unit-files realm.service &>/dev/null; then
+                journalctl -u realm.service -n 50 --no-pager
+            else
+                echo -e "${YELLOW}Realm 服务未安装，无日志可查${NC}"
+            fi
+            echo -e "${CYAN}─────────────────────────────────────${NC}"
+            echo -e "${CYAN}查看更多: journalctl -u realm.service${NC}"
+            ;;
+        0|*)
+            return
+            ;;
+    esac
+}
+
 uninstall() {
     log "开始卸载"
     echo -e "${YELLOW}▶ 正在卸载...${NC}"
@@ -1240,10 +1280,7 @@ main_menu() {
             6) service_control stop ;;
             7) service_control restart ;;
             8) manage_cron ;;
-            9)
-                echo -e "\n${BLUE}最近日志：${NC}"
-                tail -n 10 "$LOG_FILE"
-                ;;
+            9) view_logs ;;
             10)
                 read -rp "确认完全卸载？(y/n): " confirm
                 if [[ "$confirm" == "y" ]]; then
