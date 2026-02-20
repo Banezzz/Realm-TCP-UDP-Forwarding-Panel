@@ -544,7 +544,7 @@ use_udp = true
 [dns]
 mode = "ipv4_and_ipv6"
 protocol = "tcp_and_udp"
-nameservers = ["8.8.8.8:53", "8.8.4.4:53"]
+nameservers = ["8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53", "[2001:4860:4860::8888]:53", "[2606:4700:4700::1111]:53"]
 min_ttl = 0
 max_ttl = 300
 cache_size = 256
@@ -1156,8 +1156,8 @@ manage_dns() {
     fi
 
     echo -e ""
-    echo "1. 使用推荐配置（Google DNS, TTL 300s）"
-    echo "2. 使用 Cloudflare DNS（1.1.1.1）"
+    echo "1. 使用推荐配置（Google+Cloudflare IPv4/IPv6, TTL 300s）"
+    echo "2. 仅 Cloudflare DNS（IPv4/IPv6）"
     echo "3. 自定义 DNS 配置"
     echo "4. 设置 DNS 缓存 TTL（影响域名 IP 更新频率）"
     echo "5. 删除 DNS 配置（使用系统默认）"
@@ -1173,28 +1173,33 @@ manage_dns() {
                 sed -i '/^$/N;/^\n$/d' "$CONFIG_FILE"
             fi
             # 在 [network] 段后追加 DNS 配置
-            sed -i '/^use_udp/a\\n[dns]\nmode = "ipv4_and_ipv6"\nprotocol = "tcp_and_udp"\nnameservers = ["8.8.8.8:53", "8.8.4.4:53"]\nmin_ttl = 0\nmax_ttl = 300\ncache_size = 256' "$CONFIG_FILE"
-            echo -e "${GREEN}✔ 已应用推荐 DNS 配置（Google DNS, TTL 300s）${NC}"
+            sed -i '/^use_udp/a\\n[dns]\nmode = "ipv4_and_ipv6"\nprotocol = "tcp_and_udp"\nnameservers = ["8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53", "[2001:4860:4860::8888]:53", "[2606:4700:4700::1111]:53"]\nmin_ttl = 0\nmax_ttl = 300\ncache_size = 256' "$CONFIG_FILE"
+            echo -e "${GREEN}✔ 已应用推荐 DNS 配置（Google+Cloudflare IPv4/IPv6, TTL 300s）${NC}"
             echo -e "${CYAN}ℹ 域名解析结果将缓存最多 300 秒，适合动态 IP 场景${NC}"
             systemctl restart realm.service 2>/dev/null
-            log "DNS 配置已更新: Google DNS, max_ttl=300"
+            log "DNS 配置已更新: Google+Cloudflare IPv4/IPv6, max_ttl=300"
             ;;
         2)
             if grep -q '^\[dns\]' "$CONFIG_FILE"; then
                 sed -i '/^\[dns\]/,/^\[/{/^\[dns\]/d;/^\[/!d}' "$CONFIG_FILE"
                 sed -i '/^$/N;/^\n$/d' "$CONFIG_FILE"
             fi
-            sed -i '/^use_udp/a\\n[dns]\nmode = "ipv4_and_ipv6"\nprotocol = "tcp_and_udp"\nnameservers = ["1.1.1.1:53", "1.0.0.1:53"]\nmin_ttl = 0\nmax_ttl = 300\ncache_size = 256' "$CONFIG_FILE"
-            echo -e "${GREEN}✔ 已应用 Cloudflare DNS 配置（TTL 300s）${NC}"
+            sed -i '/^use_udp/a\\n[dns]\nmode = "ipv4_and_ipv6"\nprotocol = "tcp_and_udp"\nnameservers = ["1.1.1.1:53", "1.0.0.1:53", "[2606:4700:4700::1111]:53", "[2606:4700:4700::1001]:53"]\nmin_ttl = 0\nmax_ttl = 300\ncache_size = 256' "$CONFIG_FILE"
+            echo -e "${GREEN}✔ 已应用 Cloudflare DNS 配置（IPv4/IPv6, TTL 300s）${NC}"
             systemctl restart realm.service 2>/dev/null
-            log "DNS 配置已更新: Cloudflare DNS, max_ttl=300"
+            log "DNS 配置已更新: Cloudflare IPv4/IPv6, max_ttl=300"
             ;;
         3)
             echo -e "\n${BLUE}自定义 DNS 配置：${NC}"
-            read -rp "DNS 服务器1 (默认 8.8.8.8:53): " dns1
+            echo -e "${CYAN}IPv6 地址格式: [2001:4860:4860::8888]:53${NC}"
+            read -rp "DNS 服务器1 IPv4 (默认 8.8.8.8:53): " dns1
             dns1=${dns1:-"8.8.8.8:53"}
-            read -rp "DNS 服务器2 (默认 8.8.4.4:53): " dns2
-            dns2=${dns2:-"8.8.4.4:53"}
+            read -rp "DNS 服务器2 IPv4 (默认 1.1.1.1:53): " dns2
+            dns2=${dns2:-"1.1.1.1:53"}
+            read -rp "DNS 服务器3 IPv6 (默认 [2001:4860:4860::8888]:53, 留空跳过): " dns3
+            dns3=${dns3:-"[2001:4860:4860::8888]:53"}
+            read -rp "DNS 服务器4 IPv6 (默认 [2606:4700:4700::1111]:53, 留空跳过): " dns4
+            dns4=${dns4:-"[2606:4700:4700::1111]:53"}
             read -rp "最大缓存 TTL 秒数 (默认 300, 动态IP建议 60-300): " max_ttl
             max_ttl=${max_ttl:-300}
             read -rp "最小缓存 TTL 秒数 (默认 0): " min_ttl
@@ -1205,14 +1210,23 @@ manage_dns() {
                 return
             fi
 
+            # 构建 nameservers 列表
+            local ns_list="\"$dns1\", \"$dns2\""
+            if [[ -n "$dns3" ]]; then
+                ns_list="$ns_list, \"$dns3\""
+            fi
+            if [[ -n "$dns4" ]]; then
+                ns_list="$ns_list, \"$dns4\""
+            fi
+
             if grep -q '^\[dns\]' "$CONFIG_FILE"; then
                 sed -i '/^\[dns\]/,/^\[/{/^\[dns\]/d;/^\[/!d}' "$CONFIG_FILE"
                 sed -i '/^$/N;/^\n$/d' "$CONFIG_FILE"
             fi
-            sed -i "/^use_udp/a\\\\n[dns]\\nmode = \"ipv4_and_ipv6\"\\nprotocol = \"tcp_and_udp\"\\nnameservers = [\"$dns1\", \"$dns2\"]\\nmin_ttl = $min_ttl\\nmax_ttl = $max_ttl\\ncache_size = 256" "$CONFIG_FILE"
+            sed -i "/^use_udp/a\\\\n[dns]\\nmode = \"ipv4_and_ipv6\"\\nprotocol = \"tcp_and_udp\"\\nnameservers = [$ns_list]\\nmin_ttl = $min_ttl\\nmax_ttl = $max_ttl\\ncache_size = 256" "$CONFIG_FILE"
             echo -e "${GREEN}✔ 自定义 DNS 配置已保存${NC}"
             systemctl restart realm.service 2>/dev/null
-            log "DNS 配置已更新: 自定义 ($dns1, $dns2), max_ttl=$max_ttl"
+            log "DNS 配置已更新: 自定义 ($ns_list), max_ttl=$max_ttl"
             ;;
         4)
             echo -e "\n${BLUE}设置 DNS 缓存 TTL：${NC}"
