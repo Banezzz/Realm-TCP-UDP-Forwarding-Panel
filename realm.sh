@@ -3,7 +3,7 @@
 # ========================================
 # 全局配置
 # ========================================
-CURRENT_VERSION="0.3.0"
+CURRENT_VERSION="0.3.1"
 REALM_DIR="/root/realm"
 CONFIG_FILE="$REALM_DIR/config.toml"
 SERVICE_FILE="/etc/systemd/system/realm.service"
@@ -28,6 +28,35 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
+
+# ========================================
+# 地址验证函数（支持IP和域名）
+# ========================================
+validate_remote_addr() {
+    local addr="$1"
+    # IPv4 地址
+    if [[ "$addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 0
+    fi
+    # IPv6 地址（可带方括号）
+    if [[ "$addr" =~ ^\[?[0-9a-fA-F:]+\]?$ ]]; then
+        return 0
+    fi
+    # 域名（允许字母、数字、连字符、点号）
+    if [[ "$addr" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] && [[ "$addr" == *.* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+is_domain_name() {
+    local addr="$1"
+    # 如果包含字母且含有点号，认为是域名
+    if [[ "$addr" =~ [a-zA-Z] ]] && [[ "$addr" == *.* ]]; then
+        return 0
+    fi
+    return 1
+}
 
 # ========================================
 # URL 初始化函数
@@ -507,7 +536,19 @@ deploy_realm() {
 
     # 初始化配置文件
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "[network]\nno_tcp = false\nuse_udp = true" > "$CONFIG_FILE"
+        cat > "$CONFIG_FILE" <<'INITEOF'
+[network]
+no_tcp = false
+use_udp = true
+
+[dns]
+mode = "ipv4_and_ipv6"
+protocol = "tcp_and_udp"
+nameservers = ["8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53", "[2001:4860:4860::8888]:53", "[2606:4700:4700::1111]:53"]
+min_ttl = 0
+max_ttl = 300
+cache_size = 256
+INITEOF
     fi
 
     # 创建服务文件
@@ -579,7 +620,7 @@ add_rule() {
         # 获取输入
         read -rp "本地监听端口: " local_port
         [ "$local_port" = "q" ] && break
-        read -rp "目标服务器IP: " remote_ip
+        read -rp "目标服务器地址(IP或域名): " remote_addr
         read -rp "目标端口: " remote_port
         read -rp "规则备注: " remark
 
@@ -597,6 +638,21 @@ add_rule() {
         if (( remote_port < 1 || remote_port > 65535 )); then
             echo -e "${RED}✖ 目标端口必须在 1-65535 范围内！${NC}"
             continue
+        fi
+
+        # 目标地址验证（支持IP和域名）
+        if ! validate_remote_addr "$remote_addr"; then
+            echo -e "${RED}✖ 无效的目标地址！请输入有效的IP或域名${NC}"
+            continue
+        fi
+
+        # 域名提示
+        if is_domain_name "$remote_addr"; then
+            echo -e "${CYAN}ℹ 检测到域名地址，Realm 将自动进行 DNS 解析${NC}"
+            # 检查配置中是否有 [dns] 段
+            if [[ -f "$CONFIG_FILE" ]] && ! grep -q '^\[dns\]' "$CONFIG_FILE"; then
+                echo -e "${YELLOW}⚠ 建议在主菜单 [13] 中配置 DNS 设置以优化域名解析${NC}"
+            fi
         fi
 
         # 监听模式选择
@@ -641,7 +697,7 @@ add_rule() {
 [[endpoints]]
 # 备注: $remark
 listen = "$listen_addr"
-remote = "$remote_ip:$remote_port"
+remote = "$remote_addr:$remote_port"
 EOF
 
         # 双栈提示
@@ -653,7 +709,7 @@ EOF
 
         # 重启服务
         systemctl restart realm.service
-        log "规则已添加: $listen_addr → $remote_ip:$remote_port"
+        log "规则已添加: $listen_addr → $remote_addr:$remote_port"
         echo -e "${GREEN}✔ 添加成功！${NC}"
         
         read -rp "继续添加？(y/n): " cont
@@ -1074,6 +1130,142 @@ import_config() {
     esac
 }
 
+# ========================================
+# DNS 设置管理
+# ========================================
+manage_dns() {
+    echo -e "\n${YELLOW}DNS 解析设置：${NC}"
+    echo -e "${CYAN}用于转发规则中使用域名作为目标地址时的 DNS 解析配置${NC}"
+    echo -e ""
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}✖ 配置文件不存在，请先安装 Realm${NC}"
+        return
+    fi
+
+    # 显示当前 DNS 配置
+    if grep -q '^\[dns\]' "$CONFIG_FILE"; then
+        echo -e "${GREEN}当前 DNS 配置：${NC}"
+        echo -e "${CYAN}─────────────────────────────────────${NC}"
+        sed -n '/^\[dns\]/,/^\[/p' "$CONFIG_FILE" | grep -v '^\[' | grep -v '^$' | while read -r line; do
+            echo -e "  $line"
+        done
+        echo -e "${CYAN}─────────────────────────────────────${NC}"
+    else
+        echo -e "${YELLOW}当前未配置 DNS 设置（使用系统默认）${NC}"
+    fi
+
+    echo -e ""
+    echo "1. 使用推荐配置（Google+Cloudflare IPv4/IPv6, TTL 300s）"
+    echo "2. 仅 Cloudflare DNS（IPv4/IPv6）"
+    echo "3. 自定义 DNS 配置"
+    echo "4. 设置 DNS 缓存 TTL（影响域名 IP 更新频率）"
+    echo "5. 删除 DNS 配置（使用系统默认）"
+    echo "0. 返回主菜单"
+    echo -e ""
+    read -rp "请选择: " choice
+
+    case $choice in
+        1)
+            # 删除已有 [dns] 段
+            if grep -q '^\[dns\]' "$CONFIG_FILE"; then
+                sed -i '/^\[dns\]/,/^\[/{/^\[dns\]/d;/^\[/!d}' "$CONFIG_FILE"
+                sed -i '/^$/N;/^\n$/d' "$CONFIG_FILE"
+            fi
+            # 在 [network] 段后追加 DNS 配置
+            sed -i '/^use_udp/a\\n[dns]\nmode = "ipv4_and_ipv6"\nprotocol = "tcp_and_udp"\nnameservers = ["8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53", "[2001:4860:4860::8888]:53", "[2606:4700:4700::1111]:53"]\nmin_ttl = 0\nmax_ttl = 300\ncache_size = 256' "$CONFIG_FILE"
+            echo -e "${GREEN}✔ 已应用推荐 DNS 配置（Google+Cloudflare IPv4/IPv6, TTL 300s）${NC}"
+            echo -e "${CYAN}ℹ 域名解析结果将缓存最多 300 秒，适合动态 IP 场景${NC}"
+            systemctl restart realm.service 2>/dev/null
+            log "DNS 配置已更新: Google+Cloudflare IPv4/IPv6, max_ttl=300"
+            ;;
+        2)
+            if grep -q '^\[dns\]' "$CONFIG_FILE"; then
+                sed -i '/^\[dns\]/,/^\[/{/^\[dns\]/d;/^\[/!d}' "$CONFIG_FILE"
+                sed -i '/^$/N;/^\n$/d' "$CONFIG_FILE"
+            fi
+            sed -i '/^use_udp/a\\n[dns]\nmode = "ipv4_and_ipv6"\nprotocol = "tcp_and_udp"\nnameservers = ["1.1.1.1:53", "1.0.0.1:53", "[2606:4700:4700::1111]:53", "[2606:4700:4700::1001]:53"]\nmin_ttl = 0\nmax_ttl = 300\ncache_size = 256' "$CONFIG_FILE"
+            echo -e "${GREEN}✔ 已应用 Cloudflare DNS 配置（IPv4/IPv6, TTL 300s）${NC}"
+            systemctl restart realm.service 2>/dev/null
+            log "DNS 配置已更新: Cloudflare IPv4/IPv6, max_ttl=300"
+            ;;
+        3)
+            echo -e "\n${BLUE}自定义 DNS 配置：${NC}"
+            echo -e "${CYAN}IPv6 地址格式: [2001:4860:4860::8888]:53${NC}"
+            read -rp "DNS 服务器1 IPv4 (默认 8.8.8.8:53): " dns1
+            dns1=${dns1:-"8.8.8.8:53"}
+            read -rp "DNS 服务器2 IPv4 (默认 1.1.1.1:53): " dns2
+            dns2=${dns2:-"1.1.1.1:53"}
+            read -rp "DNS 服务器3 IPv6 (默认 [2001:4860:4860::8888]:53, 留空跳过): " dns3
+            dns3=${dns3:-"[2001:4860:4860::8888]:53"}
+            read -rp "DNS 服务器4 IPv6 (默认 [2606:4700:4700::1111]:53, 留空跳过): " dns4
+            dns4=${dns4:-"[2606:4700:4700::1111]:53"}
+            read -rp "最大缓存 TTL 秒数 (默认 300, 动态IP建议 60-300): " max_ttl
+            max_ttl=${max_ttl:-300}
+            read -rp "最小缓存 TTL 秒数 (默认 0): " min_ttl
+            min_ttl=${min_ttl:-0}
+
+            if ! [[ "$max_ttl" =~ ^[0-9]+$ ]] || ! [[ "$min_ttl" =~ ^[0-9]+$ ]]; then
+                echo -e "${RED}✖ TTL 必须为数字！${NC}"
+                return
+            fi
+
+            # 构建 nameservers 列表
+            local ns_list="\"$dns1\", \"$dns2\""
+            if [[ -n "$dns3" ]]; then
+                ns_list="$ns_list, \"$dns3\""
+            fi
+            if [[ -n "$dns4" ]]; then
+                ns_list="$ns_list, \"$dns4\""
+            fi
+
+            if grep -q '^\[dns\]' "$CONFIG_FILE"; then
+                sed -i '/^\[dns\]/,/^\[/{/^\[dns\]/d;/^\[/!d}' "$CONFIG_FILE"
+                sed -i '/^$/N;/^\n$/d' "$CONFIG_FILE"
+            fi
+            sed -i "/^use_udp/a\\\\n[dns]\\nmode = \"ipv4_and_ipv6\"\\nprotocol = \"tcp_and_udp\"\\nnameservers = [$ns_list]\\nmin_ttl = $min_ttl\\nmax_ttl = $max_ttl\\ncache_size = 256" "$CONFIG_FILE"
+            echo -e "${GREEN}✔ 自定义 DNS 配置已保存${NC}"
+            systemctl restart realm.service 2>/dev/null
+            log "DNS 配置已更新: 自定义 ($ns_list), max_ttl=$max_ttl"
+            ;;
+        4)
+            echo -e "\n${BLUE}设置 DNS 缓存 TTL：${NC}"
+            echo -e "${CYAN}TTL 值决定域名解析结果的缓存时间${NC}"
+            echo -e "${CYAN}  - 动态 IP（每天更换）: 建议 60-300 秒${NC}"
+            echo -e "${CYAN}  - 频繁变动 IP: 建议 10-60 秒${NC}"
+            echo -e "${CYAN}  - 稳定 IP: 建议 600-3600 秒${NC}"
+            echo -e ""
+            read -rp "请输入最大 TTL 秒数 (当前域名IP每天更换建议 300): " new_ttl
+            if ! [[ "$new_ttl" =~ ^[0-9]+$ ]]; then
+                echo -e "${RED}✖ TTL 必须为数字！${NC}"
+                return
+            fi
+            if grep -q '^\[dns\]' "$CONFIG_FILE"; then
+                sed -i "s/^max_ttl = .*/max_ttl = $new_ttl/" "$CONFIG_FILE"
+                echo -e "${GREEN}✔ DNS 缓存 TTL 已更新为 ${new_ttl} 秒${NC}"
+                systemctl restart realm.service 2>/dev/null
+                log "DNS TTL 已更新: max_ttl=$new_ttl"
+            else
+                echo -e "${YELLOW}⚠ 未找到 DNS 配置段，请先选择选项 1-3 创建 DNS 配置${NC}"
+            fi
+            ;;
+        5)
+            if grep -q '^\[dns\]' "$CONFIG_FILE"; then
+                sed -i '/^\[dns\]/,/^\[/{/^\[dns\]/d;/^\[/!d}' "$CONFIG_FILE"
+                sed -i '/^$/N;/^\n$/d' "$CONFIG_FILE"
+                echo -e "${GREEN}✔ DNS 配置已删除，将使用系统默认 DNS${NC}"
+                systemctl restart realm.service 2>/dev/null
+                log "DNS 配置已删除"
+            else
+                echo -e "${YELLOW}当前没有自定义 DNS 配置${NC}"
+            fi
+            ;;
+        0|*)
+            return
+            ;;
+    esac
+}
+
 manage_config() {
     echo -e "\n${YELLOW}配置管理：${NC}"
     echo -e ""
@@ -1265,6 +1457,7 @@ main_menu() {
         echo -e "${BLUE}    │${NC}  ${RED}[10]${NC} 🗑  完全卸载                          ${BLUE}│${NC}"
         echo -e "${BLUE}    │${NC}  ${YELLOW}[11]${NC} 🌐 代理设置                          ${BLUE}│${NC}"
         echo -e "${BLUE}    │${NC}  ${YELLOW}[12]${NC} 📦 配置导入导出                      ${BLUE}│${NC}"
+        echo -e "${BLUE}    │${NC}  ${YELLOW}[13]${NC} 🔍 DNS 解析设置                      ${BLUE}│${NC}"
         echo -e "${BLUE}    ├──────────────────────────────────────────┤${NC}"
         echo -e "${BLUE}    │${NC}  ${CYAN}[0]${NC}  ✖  退出脚本                           ${BLUE}│${NC}"
         echo -e "${BLUE}    └──────────────────────────────────────────┘${NC}"
@@ -1292,6 +1485,7 @@ main_menu() {
                 ;;
             11) manage_proxy ;;
             12) manage_config ;;
+            13) manage_dns ;;
             0) exit 0
             ;;
             *) echo -e "${RED}无效选项！${NC}" ;;
