@@ -3,7 +3,7 @@
 # ========================================
 # 全局配置
 # ========================================
-CURRENT_VERSION="0.3.1"
+CURRENT_VERSION="0.4.0"
 REALM_DIR="/root/realm"
 CONFIG_FILE="$REALM_DIR/config.toml"
 SERVICE_FILE="/etc/systemd/system/realm.service"
