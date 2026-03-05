@@ -872,23 +872,39 @@ EOF
 }
 
 delete_rule() {
+    echo -e "\n${YELLOW}请选择删除方式：${NC}"
+    echo "1) 单条删除"
+    echo "2) 批量删除"
+    read -rp "请输入选项 [1-2] (默认1): " del_mode
+    del_mode=${del_mode:-1}
+
+    case $del_mode in
+        1) delete_single_rule ;;
+        2) batch_delete_rules ;;
+        *) echo -e "${RED}无效选项！${NC}" ;;
+    esac
+}
+
+# 显示规则列表，并将 endpoints 行号数组存入 REPLY_LINES
+# 返回 0 表示有规则，1 表示无规则
+_list_rules_for_delete() {
     print_rules_header
 
     if [[ ! -f "$CONFIG_FILE" ]]; then
         echo -e "${YELLOW}配置文件不存在${NC}"
-        return
+        return 1
     fi
 
     local IFS=$'\n'
-    local lines=($(grep -n '^\[\[endpoints\]\]' "$CONFIG_FILE" 2>/dev/null))
+    REPLY_LINES=($(grep -n '^\[\[endpoints\]\]' "$CONFIG_FILE" 2>/dev/null))
 
-    if [ ${#lines[@]} -eq 0 ]; then
+    if [ ${#REPLY_LINES[@]} -eq 0 ]; then
         echo "没有发现任何转发规则。"
-        return
+        return 1
     fi
 
     local index=1
-    for line in "${lines[@]}"; do
+    for line in "${REPLY_LINES[@]}"; do
         local line_number=$(echo "$line" | cut -d ':' -f 1)
         local remark_line=$((line_number + 1))
         local listen_line=$((line_number + 2))
@@ -902,6 +918,35 @@ delete_rule() {
         echo -e "${BLUE}---------------------------------------------------------------------------------------------------------${NC}"
         ((index++))
     done
+    return 0
+}
+
+# 计算某条规则在配置文件中的起止行号
+_get_rule_line_range() {
+    local idx=$1  # 0-based index in REPLY_LINES
+    local chosen_line=${REPLY_LINES[$idx]}
+    local start_line=$(echo "$chosen_line" | cut -d ':' -f 1)
+
+    local next_endpoints_line=$(grep -n '^\[\[endpoints\]\]' "$CONFIG_FILE" | grep -A 1 "^$start_line:" | tail -n 1 | cut -d ':' -f 1)
+
+    local end_line
+    if [ -z "$next_endpoints_line" ] || [ "$next_endpoints_line" -le "$start_line" ]; then
+        end_line=$(wc -l < "$CONFIG_FILE")
+    else
+        end_line=$((next_endpoints_line - 1))
+    fi
+
+    # 包含前面的空行
+    while (( start_line > 1 )) && [[ "$(sed -n "$((start_line - 1))p" "$CONFIG_FILE")" =~ ^[[:space:]]*$ ]]; do
+        ((start_line--))
+    done
+
+    echo "$start_line $end_line"
+}
+
+delete_single_rule() {
+    local REPLY_LINES=()
+    _list_rules_for_delete || return
 
     echo ""
     echo "请输入要删除的转发规则序号，直接按回车返回主菜单。"
@@ -916,13 +961,13 @@ delete_rule() {
         return
     fi
 
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#lines[@]} ]; then
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#REPLY_LINES[@]} ]; then
         echo -e "${RED}选择超出范围，请输入有效序号。${NC}"
         return
     fi
 
     # 二次确认
-    local chosen_line=${lines[$((choice-1))]}
+    local chosen_line=${REPLY_LINES[$((choice-1))]}
     local start_line=$(echo "$chosen_line" | cut -d ':' -f 1)
     local listen_info=$(sed -n "$((start_line + 2))p" "$CONFIG_FILE" | cut -d '"' -f 2)
     local remote_info=$(sed -n "$((start_line + 3))p" "$CONFIG_FILE" | cut -d '"' -f 2)
@@ -934,26 +979,113 @@ delete_rule() {
         return
     fi
 
-    # 找到下一个 [[endpoints]] 行，确定删除范围的结束行
-    local next_endpoints_line=$(grep -n '^\[\[endpoints\]\]' "$CONFIG_FILE" | grep -A 1 "^$start_line:" | tail -n 1 | cut -d ':' -f 1)
+    local range
+    range=$(_get_rule_line_range $((choice - 1)))
+    local s_line=${range% *}
+    local e_line=${range#* }
 
-    if [ -z "$next_endpoints_line" ] || [ "$next_endpoints_line" -le "$start_line" ]; then
-        end_line=$(wc -l < "$CONFIG_FILE")
-    else
-        end_line=$((next_endpoints_line - 1))
-    fi
-
-    # 使用 sed 删除指定行范围的内容
-    sed -i "${start_line},${end_line}d" "$CONFIG_FILE"
-
-    # 检查并删除可能多余的空行
+    sed -i "${s_line},${e_line}d" "$CONFIG_FILE"
     sed -i '/^\s*$/d' "$CONFIG_FILE"
 
     log "删除规则: $listen_info → $remote_info"
     echo -e "${GREEN}✔ 转发规则已删除。${NC}"
-
-    # 重启服务
     systemctl restart realm.service
+}
+
+batch_delete_rules() {
+    local REPLY_LINES=()
+    _list_rules_for_delete || return
+
+    local total=${#REPLY_LINES[@]}
+    echo ""
+    echo -e "${CYAN}支持格式: 单个序号、逗号分隔、范围${NC}"
+    echo -e "${CYAN}示例: 3  或  1,3,5  或  23-50  或  1,3,10-20${NC}"
+    echo ""
+    read -rp "请输入要删除的规则序号: " input
+    [[ -z "$input" ]] && return
+
+    # 解析输入为序号列表
+    local -A idx_set=()
+    local parse_error=false
+
+    IFS=',' read -ra segments <<< "$input"
+    for seg in "${segments[@]}"; do
+        seg="${seg// /}"
+        if [[ "$seg" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            local range_start=${BASH_REMATCH[1]}
+            local range_end=${BASH_REMATCH[2]}
+            if (( range_start > range_end )); then
+                local tmp=$range_start; range_start=$range_end; range_end=$tmp
+            fi
+            for (( n=range_start; n<=range_end; n++ )); do
+                idx_set[$n]=1
+            done
+        elif [[ "$seg" =~ ^[0-9]+$ ]]; then
+            idx_set[$seg]=1
+        else
+            echo -e "${RED}✖ 无效输入: ${seg}${NC}"
+            parse_error=true
+        fi
+    done
+
+    if $parse_error; then
+        return
+    fi
+
+    # 排序并验证范围
+    local sorted_indices=($(echo "${!idx_set[@]}" | tr ' ' '\n' | sort -n))
+
+    if [[ ${#sorted_indices[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}未选择任何规则${NC}"
+        return
+    fi
+
+    # 范围验证
+    for idx in "${sorted_indices[@]}"; do
+        if (( idx < 1 || idx > total )); then
+            echo -e "${RED}✖ 序号 ${idx} 超出范围（共 ${total} 条规则）${NC}"
+            return
+        fi
+    done
+
+    # 预览
+    echo -e "\n${YELLOW}即将删除以下 ${#sorted_indices[@]} 条规则：${NC}"
+    echo -e "${BLUE}──────────────────────────────────────────────────────────${NC}"
+    printf "${YELLOW}%-4s %-24s %-30s %s${NC}\n" "序号" "监听地址" "目标地址" "备注"
+    echo -e "${BLUE}──────────────────────────────────────────────────────────${NC}"
+    for idx in "${sorted_indices[@]}"; do
+        local chosen_line=${REPLY_LINES[$((idx-1))]}
+        local ln=$(echo "$chosen_line" | cut -d ':' -f 1)
+        local listen_info=$(sed -n "$((ln + 2))p" "$CONFIG_FILE" | cut -d '"' -f 2)
+        local remote_info=$(sed -n "$((ln + 3))p" "$CONFIG_FILE" | cut -d '"' -f 2)
+        local remark=$(sed -n "$((ln + 1))p" "$CONFIG_FILE" | grep "^# 备注:" | cut -d ':' -f 2)
+        printf "%-4s %-24s %-30s %s\n" " $idx" "$listen_info" "$remote_info" "$remark"
+    done
+    echo -e "${BLUE}──────────────────────────────────────────────────────────${NC}"
+
+    read -rp "确认删除？(y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "已取消删除。"
+        return
+    fi
+
+    # 从后往前删除，避免行号偏移
+    local reversed_indices=($(echo "${sorted_indices[@]}" | tr ' ' '\n' | sort -rn))
+    local del_count=0
+
+    for idx in "${reversed_indices[@]}"; do
+        local range
+        range=$(_get_rule_line_range $((idx - 1)))
+        local s_line=${range% *}
+        local e_line=${range#* }
+        sed -i "${s_line},${e_line}d" "$CONFIG_FILE"
+        ((del_count++))
+    done
+
+    sed -i '/^\s*$/d' "$CONFIG_FILE"
+    systemctl restart realm.service
+    log "批量删除 ${del_count} 条规则"
+    echo -e "${GREEN}✔ 成功删除 ${del_count} 条规则！${NC}"
 }
 
 service_control() {
@@ -1599,7 +1731,7 @@ main_menu() {
         echo -e "${BLUE}    ├──────────────────────────────────────────┤${NC}"
         echo -e "${BLUE}    │${NC}  ${GREEN}[2]${NC} ➕ 添加转发规则（单条/批量）            ${BLUE}│${NC}"
         echo -e "${BLUE}    │${NC}  ${GREEN}[3]${NC} 📋 查看转发规则                       ${BLUE}│${NC}"
-        echo -e "${BLUE}    │${NC}  ${GREEN}[4]${NC} ➖ 删除转发规则                       ${BLUE}│${NC}"
+        echo -e "${BLUE}    │${NC}  ${GREEN}[4]${NC} ➖ 删除转发规则（单条/批量）            ${BLUE}│${NC}"
         echo -e "${BLUE}    ├──────────────────────────────────────────┤${NC}"
         echo -e "${BLUE}    │${NC}  ${GREEN}[5]${NC} ▶  启动服务                           ${BLUE}│${NC}"
         echo -e "${BLUE}    │${NC}  ${GREEN}[6]${NC} ■  停止服务                           ${BLUE}│${NC}"
