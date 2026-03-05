@@ -611,12 +611,27 @@ show_rules() {
     done
 }
 
-# 添加转发规则
+# 添加转发规则（入口菜单）
 add_rule() {
     log "添加转发规则"
+    echo -e "\n${YELLOW}请选择添加方式：${NC}"
+    echo "1) 单条添加"
+    echo "2) 批量添加"
+    read -rp "请输入选项 [1-2] (默认1): " add_mode
+    add_mode=${add_mode:-1}
+
+    case $add_mode in
+        1) add_single_rule ;;
+        2) batch_add_rules ;;
+        *) echo -e "${RED}无效选项！${NC}" ;;
+    esac
+}
+
+# 单条添加转发规则
+add_single_rule() {
     while : ; do
         echo -e "\n${BLUE}▶ 添加新规则（输入 q 退出）${NC}"
-        
+
         # 获取输入
         read -rp "本地监听端口: " local_port
         [ "$local_port" = "q" ] && break
@@ -711,10 +726,149 @@ EOF
         systemctl restart realm.service
         log "规则已添加: $listen_addr → $remote_addr:$remote_port"
         echo -e "${GREEN}✔ 添加成功！${NC}"
-        
+
         read -rp "继续添加？(y/n): " cont
         [[ "$cont" != "y" ]] && break
     done
+}
+
+# 批量添加转发规则
+batch_add_rules() {
+    echo -e "\n${BLUE}▶ 批量添加转发规则${NC}"
+    echo -e "${CYAN}格式: 本地端口,目标地址,目标端口[,备注][,监听模式]${NC}"
+    echo -e "${CYAN}监听模式: 1=双栈(默认) 2=仅IPv4 3=仅IPv6${NC}"
+    echo -e "${CYAN}每行一条规则，输入空行结束${NC}"
+    echo -e ""
+    echo -e "${YELLOW}示例:${NC}"
+    echo -e "  8080,1.2.3.4,80,网站转发,1"
+    echo -e "  9090,example.com,443,域名转发"
+    echo -e "  7070,10.0.0.1,22,,2"
+    echo -e ""
+
+    local rules=()
+    while true; do
+        read -rp "> " line
+        [[ -z "$line" ]] && break
+        rules+=("$line")
+    done
+
+    if [[ ${#rules[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}未输入任何规则${NC}"
+        return
+    fi
+
+    # 解析并验证所有规则
+    local valid_rules=()
+    local error_count=0
+
+    for i in "${!rules[@]}"; do
+        local line="${rules[$i]}"
+        local line_num=$((i + 1))
+
+        IFS=',' read -ra parts <<< "$line"
+
+        local lport="${parts[0]// /}"
+        local raddr="${parts[1]// /}"
+        local rport="${parts[2]// /}"
+        local remark="${parts[3]// /}"
+        local mode="${parts[4]// /}"
+        mode=${mode:-1}
+
+        # 必填字段检查
+        if [[ -z "$lport" || -z "$raddr" || -z "$rport" ]]; then
+            echo -e "${RED}✖ 第${line_num}行: 缺少必填字段（本地端口,目标地址,目标端口）${NC}"
+            ((error_count++))
+            continue
+        fi
+
+        # 端口数字验证
+        if ! [[ "$lport" =~ ^[0-9]+$ ]] || ! [[ "$rport" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}✖ 第${line_num}行: 端口必须为数字${NC}"
+            ((error_count++))
+            continue
+        fi
+
+        # 端口范围验证
+        if (( lport < 1 || lport > 65535 )); then
+            echo -e "${RED}✖ 第${line_num}行: 本地端口必须在 1-65535 范围内${NC}"
+            ((error_count++))
+            continue
+        fi
+        if (( rport < 1 || rport > 65535 )); then
+            echo -e "${RED}✖ 第${line_num}行: 目标端口必须在 1-65535 范围内${NC}"
+            ((error_count++))
+            continue
+        fi
+
+        # 目标地址验证
+        if ! validate_remote_addr "$raddr"; then
+            echo -e "${RED}✖ 第${line_num}行: 无效的目标地址${NC}"
+            ((error_count++))
+            continue
+        fi
+
+        # 监听模式验证
+        if ! [[ "$mode" =~ ^[123]$ ]]; then
+            echo -e "${RED}✖ 第${line_num}行: 监听模式必须为 1/2/3${NC}"
+            ((error_count++))
+            continue
+        fi
+
+        # 生成监听地址
+        local listen_addr
+        case $mode in
+            1) listen_addr="[::]:$lport" ;;
+            2) listen_addr="0.0.0.0:$lport" ;;
+            3) listen_addr="[::]:$lport" ;;
+        esac
+
+        valid_rules+=("${listen_addr}|${raddr}:${rport}|${remark}")
+    done
+
+    if [[ ${#valid_rules[@]} -eq 0 ]]; then
+        echo -e "${RED}✖ 没有有效的规则可添加${NC}"
+        return
+    fi
+
+    # 存在错误时询问是否继续
+    if (( error_count > 0 )); then
+        echo -e "\n${YELLOW}⚠ ${error_count} 条规则有误，${#valid_rules[@]} 条有效，是否继续添加有效规则？${NC}"
+        read -rp "(y/n): " cont
+        [[ "$cont" != "y" ]] && return
+    fi
+
+    # 预览
+    echo -e "\n${YELLOW}将添加以下 ${#valid_rules[@]} 条规则：${NC}"
+    echo -e "${BLUE}──────────────────────────────────────────────────────────${NC}"
+    printf "${YELLOW}%-4s %-24s %-30s %s${NC}\n" "序号" "监听地址" "目标地址" "备注"
+    echo -e "${BLUE}──────────────────────────────────────────────────────────${NC}"
+    local idx=1
+    for rule in "${valid_rules[@]}"; do
+        IFS='|' read -ra p <<< "$rule"
+        printf "%-4s %-24s %-30s %s\n" " $idx" "${p[0]}" "${p[1]}" "${p[2]}"
+        ((idx++))
+    done
+    echo -e "${BLUE}──────────────────────────────────────────────────────────${NC}"
+
+    read -rp "确认添加？(y/n): " confirm
+    [[ "$confirm" != "y" ]] && return
+
+    # 写入配置
+    for rule in "${valid_rules[@]}"; do
+        IFS='|' read -ra p <<< "$rule"
+        cat >> "$CONFIG_FILE" <<EOF
+
+[[endpoints]]
+# 备注: ${p[2]}
+listen = "${p[0]}"
+remote = "${p[1]}"
+EOF
+    done
+
+    # 统一重启
+    systemctl restart realm.service
+    log "批量添加 ${#valid_rules[@]} 条规则"
+    echo -e "${GREEN}✔ 成功添加 ${#valid_rules[@]} 条规则！${NC}"
 }
 
 delete_rule() {
@@ -1443,7 +1597,7 @@ main_menu() {
         echo -e "${BLUE}    ┌──────────────────────────────────────────┐${NC}"
         echo -e "${BLUE}    │${NC}  ${GREEN}[1]${NC} ⚡ 安装/更新 Realm                    ${BLUE}│${NC}"
         echo -e "${BLUE}    ├──────────────────────────────────────────┤${NC}"
-        echo -e "${BLUE}    │${NC}  ${GREEN}[2]${NC} ➕ 添加转发规则                       ${BLUE}│${NC}"
+        echo -e "${BLUE}    │${NC}  ${GREEN}[2]${NC} ➕ 添加转发规则（单条/批量）            ${BLUE}│${NC}"
         echo -e "${BLUE}    │${NC}  ${GREEN}[3]${NC} 📋 查看转发规则                       ${BLUE}│${NC}"
         echo -e "${BLUE}    │${NC}  ${GREEN}[4]${NC} ➖ 删除转发规则                       ${BLUE}│${NC}"
         echo -e "${BLUE}    ├──────────────────────────────────────────┤${NC}"
