@@ -2366,7 +2366,7 @@ iptables_menu() {
         echo -e "${BLUE}    └──────────────────────────────────────────┘${NC}"
         echo -e ""
         echo -ne "    ${CYAN}>>>${NC} 请输入选项: "
-        read -r ichoice
+        read -r ichoice || { echo; return; }
 
         case $ichoice in
             1)
@@ -2440,6 +2440,12 @@ check_installed() {
 # 主界面
 # ========================================
 main_menu() {
+    # 当脚本以管道方式运行时（如 curl | bash），stdin 为 EOF
+    # 重新从终端打开 stdin，避免 read 立即返回导致菜单闪烁
+    if [[ ! -t 0 ]]; then
+        exec < /dev/tty 2>/dev/null || true
+    fi
+
     clear
     init_check
 
@@ -2533,7 +2539,7 @@ main_menu() {
         echo -e "${BLUE}    └──────────────────────────────────────────┘${NC}"
         echo -e ""
         echo -ne "    ${CYAN}>>>${NC} 请输入选项: "
-        read -r choice
+        read -r choice || { echo; exit 0; }
         case $choice in
             1) deploy_realm ;;
             2) add_rule ;;
