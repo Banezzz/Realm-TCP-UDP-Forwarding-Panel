@@ -3,7 +3,7 @@
 # ========================================
 # 全局配置
 # ========================================
-CURRENT_VERSION="0.4.0"
+CURRENT_VERSION="0.5.0"
 REALM_DIR="/root/realm"
 CONFIG_FILE="$REALM_DIR/config.toml"
 SERVICE_FILE="/etc/systemd/system/realm.service"
@@ -15,6 +15,9 @@ IPTABLES_DIR="/root/iptables-forward"
 IPTABLES_RULES_FILE="$IPTABLES_DIR/rules.conf"
 IPTABLES_SERVICE_FILE="/etc/systemd/system/iptables-forward.service"
 IPTABLES_CHAIN="IPT-FORWARD"
+
+# 转发方式切换备份目录
+SWITCH_BACKUP_DIR="$REALM_DIR/switch-backups"
 
 # 代理变量（初始为空）
 PROXY=""
@@ -1694,16 +1697,22 @@ resolve_addr() {
     fi
 }
 
-# 初始化 iptables 目录和规则文件
-init_iptables_dir() {
+# 写入（重置）iptables 规则文件头部说明
+_write_iptables_rules_header() {
     mkdir -p "$IPTABLES_DIR"
-    if [[ ! -f "$IPTABLES_RULES_FILE" ]]; then
-        cat > "$IPTABLES_RULES_FILE" <<'EOF'
+    cat > "$IPTABLES_RULES_FILE" <<'EOF'
 # iptables 转发规则配置文件
 # 格式: 本地端口|协议|目标地址|目标端口|备注|监听模式
 # 协议: tcp / udp / both
 # 监听模式: 1=双栈(IPv4+IPv6) 2=仅IPv4 3=仅IPv6
 EOF
+}
+
+# 初始化 iptables 目录和规则文件
+init_iptables_dir() {
+    mkdir -p "$IPTABLES_DIR"
+    if [[ ! -f "$IPTABLES_RULES_FILE" ]]; then
+        _write_iptables_rules_header
     fi
 }
 
@@ -2288,13 +2297,7 @@ flush_iptables_rules() {
     read -rp "确认清空？(y/N): " confirm
     [[ ! "$confirm" =~ ^[Yy]$ ]] && { echo "已取消。"; return; }
 
-    init_iptables_dir
-    cat > "$IPTABLES_RULES_FILE" <<'EOF'
-# iptables 转发规则配置文件
-# 格式: 本地端口|协议|目标地址|目标端口|备注|监听模式
-# 协议: tcp / udp / both
-# 监听模式: 1=双栈(IPv4+IPv6) 2=仅IPv4 3=仅IPv6
-EOF
+    _write_iptables_rules_header
 
     iptables -t nat -F "$IPTABLES_CHAIN" 2>/dev/null
     if command -v ip6tables &>/dev/null; then
@@ -2362,6 +2365,8 @@ iptables_menu() {
         echo -e "${BLUE}    │${NC}  ${GREEN}[5]${NC} 🔍 查看 iptables NAT 规则              ${BLUE}│${NC}"
         echo -e "${BLUE}    │${NC}  ${RED}[6]${NC} 🗑  清空所有转发规则                    ${BLUE}│${NC}"
         echo -e "${BLUE}    ├──────────────────────────────────────────┤${NC}"
+        echo -e "${BLUE}    │${NC}  ${YELLOW}[7]${NC} 🔁 切换到 Realm 转发                   ${BLUE}│${NC}"
+        echo -e "${BLUE}    ├──────────────────────────────────────────┤${NC}"
         echo -e "${BLUE}    │${NC}  ${CYAN}[0]${NC} ←  返回主菜单                          ${BLUE}│${NC}"
         echo -e "${BLUE}    └──────────────────────────────────────────┘${NC}"
         echo -e ""
@@ -2394,6 +2399,928 @@ iptables_menu() {
                 ;;
             6)
                 flush_iptables_rules
+                read -rp "按回车键继续..."
+                ;;
+            7)
+                switch_iptables_to_realm
+                read -rp "按回车键继续..."
+                ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项！${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ========================================
+# 转发方式切换（Realm ⇄ iptables）
+# ========================================
+# 统一中间格式（与 iptables 规则文件格式一致）：
+#   本地端口|协议|目标地址|目标端口|备注|监听模式
+#   协议: tcp / udp / both        监听模式: 1=双栈 2=仅IPv4 3=仅IPv6
+
+# 拆分 "地址:端口" → SPLIT_HOST / SPLIT_PORT
+_split_host_port() {
+    local s="$1"
+    SPLIT_HOST=""
+    SPLIT_PORT=""
+    if [[ "$s" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+        SPLIT_HOST="${BASH_REMATCH[1]}"
+        SPLIT_PORT="${BASH_REMATCH[2]}"
+        return 0
+    fi
+    if [[ "$s" =~ ^([^:]+):([0-9]+)$ ]]; then
+        SPLIT_HOST="${BASH_REMATCH[1]}"
+        SPLIT_PORT="${BASH_REMATCH[2]}"
+        return 0
+    fi
+    return 1
+}
+
+# 监听模式 → 描述（三个取值均占 4 个显示宽度，便于表格对齐）
+_mode_desc() {
+    case "$1" in
+        2) echo "IPv4" ;;
+        3) echo "IPv6" ;;
+        *) echo "双栈" ;;
+    esac
+}
+
+# 监听模式 + 端口 → Realm 监听地址
+_mode_to_listen() {
+    case "$1" in
+        2) echo "0.0.0.0:$2" ;;
+        *) echo "[::]:$2" ;;
+    esac
+}
+
+# 目标地址 + 端口 → Realm remote 字符串（裸 IPv6 自动补方括号）
+_join_remote() {
+    local addr="$1"
+    if [[ "$addr" == *:* && "$addr" != \[* ]]; then
+        echo "[${addr}]:$2"
+    else
+        echo "${addr}:$2"
+    fi
+}
+
+# 读取 Realm [network] 全局协议设置 → both / tcp / udp
+_get_realm_global_protocol() {
+    local no_tcp use_udp
+    if [[ -f "$CONFIG_FILE" ]]; then
+        no_tcp=$(grep -E '^[[:space:]]*no_tcp[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null | head -1 | grep -oE 'true|false')
+        use_udp=$(grep -E '^[[:space:]]*use_udp[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null | head -1 | grep -oE 'true|false')
+    fi
+    no_tcp=${no_tcp:-false}
+    use_udp=${use_udp:-true}
+
+    if [[ "$no_tcp" == "true" && "$use_udp" == "true" ]]; then
+        echo "udp"
+    elif [[ "$no_tcp" == "false" && "$use_udp" == "false" ]]; then
+        echo "tcp"
+    else
+        echo "both"
+    fi
+}
+
+# 写入 Realm [network] 全局协议设置
+_set_realm_global_protocol() {
+    local proto="$1" no_tcp use_udp
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    case "$proto" in
+        tcp) no_tcp="false"; use_udp="false" ;;
+        udp) no_tcp="true";  use_udp="true"  ;;
+        *)   no_tcp="false"; use_udp="true"  ;;
+    esac
+
+    if grep -qE '^[[:space:]]*no_tcp[[:space:]]*=' "$CONFIG_FILE"; then
+        sed -i -E "s|^[[:space:]]*no_tcp[[:space:]]*=.*|no_tcp = ${no_tcp}|" "$CONFIG_FILE"
+    fi
+    if grep -qE '^[[:space:]]*use_udp[[:space:]]*=' "$CONFIG_FILE"; then
+        sed -i -E "s|^[[:space:]]*use_udp[[:space:]]*=.*|use_udp = ${use_udp}|" "$CONFIG_FILE"
+    fi
+    return 0
+}
+
+# 规则条数统计
+_realm_rule_count() {
+    [[ -f "$CONFIG_FILE" ]] || { echo 0; return; }
+    local n
+    n=$(grep -cE '^[[:space:]]*\[\[endpoints\]\]' "$CONFIG_FILE" 2>/dev/null)
+    echo "${n:-0}"
+}
+
+_iptables_rule_count() {
+    [[ -f "$IPTABLES_RULES_FILE" ]] || { echo 0; return; }
+    local n
+    n=$(grep -cE '^[^#[:space:]][^|]*\|' "$IPTABLES_RULES_FILE" 2>/dev/null)
+    echo "${n:-0}"
+}
+
+# 当前内核中 IPT-FORWARD 链的条目数
+_iptables_chain_count() {
+    command -v iptables &>/dev/null || { echo 0; return; }
+    local n
+    n=$(iptables -t nat -S "$IPTABLES_CHAIN" 2>/dev/null | grep -c '^-A')
+    echo "${n:-0}"
+}
+
+# 解析 Realm 规则 → SWITCH_RULES 数组（附带 SWITCH_WARNINGS 提示）
+parse_realm_rules() {
+    SWITCH_RULES=()
+    SWITCH_WARNINGS=()
+
+    [[ -f "$CONFIG_FILE" ]] || return 1
+
+    local proto
+    proto=$(_get_realm_global_protocol)
+
+    # 使用非空白分隔符，避免 read 吞掉空备注造成的字段错位
+    local remark listen remote lhost lport raddr rport mode
+    while IFS=$'\037' read -r remark listen remote; do
+        [[ -z "$listen" || -z "$remote" ]] && continue
+
+        if ! _split_host_port "$listen"; then
+            SWITCH_WARNINGS+=("跳过无法解析的监听地址: ${listen}")
+            continue
+        fi
+        lhost="$SPLIT_HOST"
+        lport="$SPLIT_PORT"
+
+        case "$lhost" in
+            "::"|"0:0:0:0:0:0:0:0")
+                mode=1
+                ;;
+            "0.0.0.0"|"*")
+                mode=2
+                ;;
+            *)
+                if [[ "$lhost" == *:* ]]; then
+                    mode=3
+                    SWITCH_WARNINGS+=("${listen} 绑定了指定 IPv6 地址，转换后将监听全部 IPv6 地址")
+                else
+                    mode=2
+                    SWITCH_WARNINGS+=("${listen} 绑定了指定 IPv4 地址，转换后将监听全部 IPv4 地址")
+                fi
+                ;;
+        esac
+
+        if ! _split_host_port "$remote"; then
+            SWITCH_WARNINGS+=("跳过无法解析的目标地址: ${remote}")
+            continue
+        fi
+        raddr="$SPLIT_HOST"
+        rport="$SPLIT_PORT"
+
+        # 备注中的分隔符会破坏 iptables 规则文件格式
+        remark="${remark//|/ }"
+
+        SWITCH_RULES+=("${lport}|${proto}|${raddr}|${rport}|${remark}|${mode}")
+    done < <(awk '
+        BEGIN { SEP = sprintf("%c", 31) }
+        /^[[:space:]]*\[\[endpoints\]\]/ {
+            if (found) print remark SEP listen SEP remote
+            found = 1; remark = ""; listen = ""; remote = ""
+            next
+        }
+        /^[[:space:]]*\[/ {
+            if (found) { print remark SEP listen SEP remote; found = 0 }
+            next
+        }
+        found == 0 { next }
+        /^[[:space:]]*#/ {
+            if (index($0, "备注") > 0) {
+                line = $0
+                sub(/^[^:]*:[[:space:]]*/, "", line)
+                remark = line
+            }
+            next
+        }
+        /^[[:space:]]*listen[[:space:]]*=/ {
+            if (match($0, /"[^"]*"/)) listen = substr($0, RSTART + 1, RLENGTH - 2)
+            next
+        }
+        /^[[:space:]]*remote[[:space:]]*=/ {
+            if (match($0, /"[^"]*"/)) remote = substr($0, RSTART + 1, RLENGTH - 2)
+            next
+        }
+        END { if (found) print remark SEP listen SEP remote }
+    ' "$CONFIG_FILE")
+
+    return 0
+}
+
+# 解析 iptables 规则 → SWITCH_RULES 数组
+parse_iptables_rules() {
+    SWITCH_RULES=()
+    SWITCH_WARNINGS=()
+
+    [[ -f "$IPTABLES_RULES_FILE" ]] || return 1
+
+    local lport proto raddr rport remark mode
+    while IFS='|' read -r lport proto raddr rport remark mode; do
+        [[ "$lport" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${lport// /}" ]] && continue
+        [[ -z "$raddr" || -z "$rport" ]] && continue
+
+        lport="${lport// /}"
+        proto="${proto:-both}"
+        mode="${mode:-1}"
+        [[ "$mode" =~ ^[123]$ ]] || mode=1
+
+        SWITCH_RULES+=("${lport}|${proto}|${raddr}|${rport}|${remark}|${mode}")
+    done < "$IPTABLES_RULES_FILE"
+
+    return 0
+}
+
+# 迁移预览表（$1 = 目标方式 realm / iptables）
+_preview_switch_rules() {
+    local target="$1"
+    local title_after
+    if [[ "$target" == "realm" ]]; then
+        title_after="转换后(Realm 监听)"
+    else
+        title_after="转换后(iptables)"
+    fi
+
+    echo -e "${BLUE}────────────────────────────────────────────────────────────────────────────────${NC}"
+    # 监听模式列的取值显示宽度一致，直接跟两个空格，避免中英文混排错位
+    printf "${YELLOW}%-4s %-24s %-6s %s  %-26s %s${NC}\n" "序号" "$title_after" "协议" "监听" "目标地址" "备注"
+    echo -e "${BLUE}────────────────────────────────────────────────────────────────────────────────${NC}"
+
+    local idx=1 rule lp proto raddr rport remark mode listen_str
+    for rule in "${SWITCH_RULES[@]}"; do
+        IFS='|' read -r lp proto raddr rport remark mode <<< "$rule"
+        if [[ "$target" == "realm" ]]; then
+            listen_str=$(_mode_to_listen "$mode" "$lp")
+        else
+            listen_str="DNAT :${lp}"
+        fi
+        printf "%-4s %-24s %-6s %s  %-26s %s\n" \
+            "$idx" "$listen_str" "$proto" "$(_mode_desc "$mode")" "$(_join_remote "$raddr" "$rport")" "$remark"
+        ((idx++))
+    done
+    echo -e "${BLUE}────────────────────────────────────────────────────────────────────────────────${NC}"
+}
+
+# 清空 Realm 配置中的所有 [[endpoints]] 段（保留 [network] / [dns] 等）
+_clear_realm_endpoints() {
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    local tmp="${CONFIG_FILE}.switch.tmp"
+
+    awk '
+        /^[[:space:]]*\[\[endpoints\]\]/ { skip = 1; next }
+        /^[[:space:]]*\[endpoints\./     { if (skip) next }
+        /^[[:space:]]*\[/                { skip = 0 }
+        skip { next }
+        { print }
+    ' "$CONFIG_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+
+    # 去掉结尾多余空行
+    awk 'BEGIN{blank=0} {if ($0 ~ /^[[:space:]]*$/) {blank++} else {while (blank>0){print ""; blank--}; print}}' \
+        "$tmp" > "${tmp}.2" && mv "${tmp}.2" "$tmp"
+
+    mv "$tmp" "$CONFIG_FILE"
+    return 0
+}
+
+# 若 Realm 配置文件不存在则创建默认骨架
+_ensure_realm_config() {
+    [[ -f "$CONFIG_FILE" ]] && return 0
+    mkdir -p "$REALM_DIR"
+    cat > "$CONFIG_FILE" <<'INITEOF'
+[network]
+no_tcp = false
+use_udp = true
+
+[dns]
+mode = "ipv4_and_ipv6"
+protocol = "tcp_and_udp"
+nameservers = ["8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53", "[2001:4860:4860::8888]:53", "[2606:4700:4700::1111]:53"]
+min_ttl = 0
+max_ttl = 300
+cache_size = 256
+INITEOF
+    return 0
+}
+
+# 切换前备份（$1 = 方向标识）→ 输出备份目录路径
+_create_switch_backup() {
+    local direction="$1"
+    local ts dir
+    ts=$(date '+%Y%m%d-%H%M%S')
+    dir="${SWITCH_BACKUP_DIR}/${ts}-${direction}"
+
+    mkdir -p "$dir" 2>/dev/null || return 1
+    [[ -f "$CONFIG_FILE" ]] && cp "$CONFIG_FILE" "$dir/config.toml" 2>/dev/null
+    [[ -f "$IPTABLES_RULES_FILE" ]] && cp "$IPTABLES_RULES_FILE" "$dir/rules.conf" 2>/dev/null
+
+    {
+        echo "direction=${direction}"
+        echo "time=$(date '+%Y-%m-%d %H:%M:%S')"
+        echo "realm_rules=$(_realm_rule_count)"
+        echo "iptables_rules=$(_iptables_rule_count)"
+        echo "iptables_chain=$(_iptables_chain_count)"
+        echo "realm_active=$(systemctl is-active realm 2>/dev/null || true)"
+        echo "realm_enabled=$(systemctl is-enabled realm 2>/dev/null || true)"
+        echo "iptables_enabled=$(systemctl is-enabled iptables-forward 2>/dev/null || true)"
+    } > "$dir/meta.conf" 2>/dev/null
+
+    # 只保留最近 10 份备份
+    local old
+    while read -r old; do
+        [[ -n "$old" ]] && rm -rf "$old"
+    done < <(ls -1dt "${SWITCH_BACKUP_DIR}"/*/ 2>/dev/null | tail -n +11)
+
+    echo "$dir"
+    return 0
+}
+
+# 读取备份元信息 _meta_get <文件> <键>
+_meta_get() {
+    [[ -f "$1" ]] || return 1
+    grep -E "^$2=" "$1" 2>/dev/null | head -1 | cut -d'=' -f2-
+}
+
+# 停止 Realm 服务
+_stop_realm_service() {
+    systemctl stop realm 2>/dev/null
+    systemctl disable realm 2>/dev/null
+}
+
+# 停止 iptables 转发（清空内核规则 + 停用开机自启）
+_stop_iptables_forward() {
+    iptables -t nat -F "$IPTABLES_CHAIN" 2>/dev/null
+    if command -v ip6tables &>/dev/null; then
+        ip6tables -t nat -F "$IPTABLES_CHAIN" 2>/dev/null
+    fi
+    systemctl stop iptables-forward 2>/dev/null
+    systemctl disable iptables-forward 2>/dev/null
+}
+
+# ----------------------------------------
+# Realm ➜ iptables
+# ----------------------------------------
+switch_realm_to_iptables() {
+    echo -e "\n${CYAN}══════════ Realm ➜ iptables 规则迁移 ══════════${NC}"
+
+    check_iptables || return
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}✖ 未找到 Realm 配置文件: ${CONFIG_FILE}${NC}"
+        return
+    fi
+
+    parse_realm_rules
+    if [[ ${#SWITCH_RULES[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}⚠ Realm 配置中没有可迁移的转发规则${NC}"
+        return
+    fi
+
+    local global_proto
+    global_proto=$(_get_realm_global_protocol)
+
+    echo -e "\n${YELLOW}将把以下 ${#SWITCH_RULES[@]} 条 Realm 规则转换为 iptables 转发：${NC}"
+    _preview_switch_rules iptables
+
+    echo -e "\n${CYAN}转换说明：${NC}"
+    echo -e "  • 协议取自 Realm ${CYAN}[network]${NC} 全局设置，当前为 ${GREEN}${global_proto}${NC}"
+    echo -e "  • iptables 走内核 NAT，切换后本机不再监听端口（${CYAN}ss -tlnp${NC} 看不到）"
+    echo -e "  • 目标为域名时，iptables 仅在应用规则时解析一次，域名 IP 变化后需重新应用"
+    local w
+    for w in "${SWITCH_WARNINGS[@]}"; do
+        echo -e "  ${YELLOW}⚠ ${w}${NC}"
+    done
+
+    # ---- 目标侧写入方式 ----
+    init_iptables_dir
+    local -A exist_ports=()
+    local existing_count
+    existing_count=$(_iptables_rule_count)
+
+    local write_mode=1
+    if (( existing_count > 0 )); then
+        local p
+        while IFS='|' read -r p _; do
+            [[ "$p" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${p// /}" ]] && continue
+            exist_ports["${p// /}"]=1
+        done < "$IPTABLES_RULES_FILE"
+
+        echo -e "\n${YELLOW}iptables 侧已存在 ${existing_count} 条规则，如何写入？${NC}"
+        echo "1) 覆盖：清空 iptables 现有规则后写入"
+        echo "2) 合并：保留现有规则，本地端口冲突的跳过（默认）"
+        read -rp "请输入选项 [1-2] (默认2): " write_mode
+        write_mode=${write_mode:-2}
+        if ! [[ "$write_mode" =~ ^[12]$ ]]; then
+            echo -e "${RED}✖ 无效选项，已取消${NC}"
+            return
+        fi
+    fi
+
+    # ---- 源侧处理方式 ----
+    echo -e "\n${YELLOW}迁移完成后如何处理 Realm（源方式）？${NC}"
+    echo "1) 停止并禁用 Realm 服务，同时清空 Realm 规则（彻底切换）"
+    echo "2) 停止并禁用 Realm 服务，保留 Realm 规则（默认，可随时切回）"
+    echo "3) 保持 Realm 运行（不推荐：端口重叠时 iptables DNAT 优先，Realm 收不到流量）"
+    read -rp "请输入选项 [1-3] (默认2): " src_action
+    src_action=${src_action:-2}
+    if ! [[ "$src_action" =~ ^[123]$ ]]; then
+        echo -e "${RED}✖ 无效选项，已取消${NC}"
+        return
+    fi
+
+    echo -e ""
+    read -rp "确认开始迁移？(y/N): " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && { echo "已取消。"; return; }
+
+    # ---- 执行 ----
+    local backup_dir
+    backup_dir=$(_create_switch_backup "realm2iptables")
+    if [[ -n "$backup_dir" ]]; then
+        echo -e "${GREEN}✓ 已备份切换前状态: ${backup_dir}${NC}"
+    else
+        echo -e "${YELLOW}⚠ 备份创建失败，将继续迁移${NC}"
+    fi
+
+    if [[ "$write_mode" == "1" ]]; then
+        _write_iptables_rules_header
+    fi
+
+    local added=0 skipped=0 rule lp
+    for rule in "${SWITCH_RULES[@]}"; do
+        IFS='|' read -r lp _ <<< "$rule"
+        if [[ "$write_mode" == "2" && -n "${exist_ports[$lp]}" ]]; then
+            echo -e "${YELLOW}  ↷ 端口 ${lp} 在 iptables 侧已存在，跳过${NC}"
+            ((skipped++))
+            continue
+        fi
+        echo "$rule" >> "$IPTABLES_RULES_FILE"
+        ((added++))
+    done
+
+    echo -e "${CYAN}正在应用 iptables 规则...${NC}"
+    apply_all_iptables_rules
+    systemctl enable iptables-forward &>/dev/null
+    systemctl start iptables-forward &>/dev/null
+
+    case "$src_action" in
+        1)
+            _stop_realm_service
+            _clear_realm_endpoints
+            echo -e "${GREEN}✓ Realm 服务已停止并禁用，Realm 规则已清空${NC}"
+            ;;
+        2)
+            _stop_realm_service
+            echo -e "${GREEN}✓ Realm 服务已停止并禁用，配置文件保留（可随时切回）${NC}"
+            ;;
+        3)
+            echo -e "${YELLOW}⚠ Realm 仍在运行，端口重叠时流量将被 iptables DNAT 优先接管${NC}"
+            ;;
+    esac
+
+    log "转发方式切换: Realm → iptables，写入 ${added} 条，跳过 ${skipped} 条"
+    echo -e "\n${GREEN}✔ 迁移完成：写入 ${added} 条规则${NC}"
+    (( skipped > 0 )) && echo -e "${YELLOW}  跳过 ${skipped} 条（端口冲突）${NC}"
+    echo -e "${CYAN}  当前生效的 NAT 条目: $(_iptables_chain_count) 条${NC}"
+}
+
+# ----------------------------------------
+# iptables ➜ Realm
+# ----------------------------------------
+switch_iptables_to_realm() {
+    echo -e "\n${CYAN}══════════ iptables ➜ Realm 规则迁移 ══════════${NC}"
+
+    if [[ ! -f "$IPTABLES_RULES_FILE" ]]; then
+        echo -e "${RED}✖ 未找到 iptables 规则文件: ${IPTABLES_RULES_FILE}${NC}"
+        return
+    fi
+
+    parse_iptables_rules
+    if [[ ${#SWITCH_RULES[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}⚠ iptables 规则文件中没有可迁移的转发规则${NC}"
+        return
+    fi
+
+    echo -e "\n${YELLOW}将把以下 ${#SWITCH_RULES[@]} 条 iptables 规则转换为 Realm 转发：${NC}"
+    _preview_switch_rules realm
+
+    # 协议一致性分析（Realm 的协议开关是全局的）+ 仅IPv6 规则统计
+    local rule lp proto raddr rport remark mode
+    local -A proto_set=()
+    local v6only_count=0
+    for rule in "${SWITCH_RULES[@]}"; do
+        IFS='|' read -r lp proto raddr rport remark mode <<< "$rule"
+        proto_set["$proto"]=1
+        [[ "$mode" == "3" ]] && ((v6only_count++))
+    done
+
+    local uniq_proto=""
+    if [[ ${#proto_set[@]} -eq 1 ]]; then
+        uniq_proto="${!proto_set[@]}"
+    fi
+
+    echo -e "\n${CYAN}转换说明：${NC}"
+    echo -e "  • Realm 走用户态转发，切换后本机会真实监听这些端口"
+    echo -e "  • 目标为域名时 Realm 会自动跟随 DNS 变化，无需重新应用"
+    echo -e "  • ${YELLOW}Realm 的 TCP/UDP 开关是全局的（[network] 段），不能逐条设置${NC}"
+
+    local target_proto="both"
+    if [[ -n "$uniq_proto" && "$uniq_proto" != "both" ]]; then
+        echo -e "  • 全部规则协议一致（${GREEN}${uniq_proto}${NC}），可同步写入 Realm 全局协议设置"
+        read -rp "是否将 Realm 全局协议设为 ${uniq_proto}？(Y/n): " set_proto
+        set_proto=${set_proto:-Y}
+        [[ "$set_proto" =~ ^[Yy]$ ]] && target_proto="$uniq_proto"
+    elif [[ -z "$uniq_proto" ]]; then
+        echo -e "  ${YELLOW}⚠ 规则中混用了不同协议，转换后统一按 TCP+UDP 处理${NC}"
+    fi
+
+    if (( v6only_count > 0 )); then
+        echo -e "  ${YELLOW}⚠ 有 ${v6only_count} 条「仅IPv6」规则：Realm 以 [::] 双栈方式监听，切回 iptables 时会变成双栈${NC}"
+    fi
+
+    local w
+    for w in "${SWITCH_WARNINGS[@]}"; do
+        echo -e "  ${YELLOW}⚠ ${w}${NC}"
+    done
+
+    if [[ ! -x "$REALM_DIR/realm" || ! -f "$SERVICE_FILE" ]]; then
+        echo -e "  ${YELLOW}⚠ Realm 尚未安装，规则会写入配置文件，但需先通过主菜单 [1] 安装才能生效${NC}"
+    fi
+
+    # ---- 目标侧写入方式 ----
+    _ensure_realm_config
+    local -A exist_ports=()
+    local existing_count
+    existing_count=$(_realm_rule_count)
+
+    local write_mode=1
+    if (( existing_count > 0 )); then
+        local old_rules=() r
+        parse_realm_rules
+        old_rules=("${SWITCH_RULES[@]}")
+        for r in "${old_rules[@]}"; do
+            IFS='|' read -r lp _ <<< "$r"
+            exist_ports["$lp"]=1
+        done
+        # 恢复待迁移规则集
+        parse_iptables_rules
+
+        echo -e "\n${YELLOW}Realm 侧已存在 ${existing_count} 条规则，如何写入？${NC}"
+        echo "1) 覆盖：清空 Realm 现有规则后写入"
+        echo "2) 合并：保留现有规则，本地端口冲突的跳过（默认）"
+        read -rp "请输入选项 [1-2] (默认2): " write_mode
+        write_mode=${write_mode:-2}
+        if ! [[ "$write_mode" =~ ^[12]$ ]]; then
+            echo -e "${RED}✖ 无效选项，已取消${NC}"
+            return
+        fi
+    fi
+
+    # ---- 源侧处理方式 ----
+    echo -e "\n${YELLOW}迁移完成后如何处理 iptables（源方式）？${NC}"
+    echo "1) 清空内核 NAT 规则并停用开机自启，同时清空 iptables 规则文件（彻底切换）"
+    echo "2) 清空内核 NAT 规则并停用开机自启，保留规则文件（默认，可随时切回）"
+    echo "3) 保留 iptables 规则（不推荐：DNAT 优先级高于 Realm 监听，Realm 收不到流量）"
+    read -rp "请输入选项 [1-3] (默认2): " src_action
+    src_action=${src_action:-2}
+    if ! [[ "$src_action" =~ ^[123]$ ]]; then
+        echo -e "${RED}✖ 无效选项，已取消${NC}"
+        return
+    fi
+
+    echo -e ""
+    read -rp "确认开始迁移？(y/N): " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && { echo "已取消。"; return; }
+
+    # ---- 执行 ----
+    local backup_dir
+    backup_dir=$(_create_switch_backup "iptables2realm")
+    if [[ -n "$backup_dir" ]]; then
+        echo -e "${GREEN}✓ 已备份切换前状态: ${backup_dir}${NC}"
+    else
+        echo -e "${YELLOW}⚠ 备份创建失败，将继续迁移${NC}"
+    fi
+
+    if [[ "$write_mode" == "1" ]]; then
+        _clear_realm_endpoints
+    fi
+
+    _set_realm_global_protocol "$target_proto"
+
+    local added=0 skipped=0 listen_addr remote_full
+    for rule in "${SWITCH_RULES[@]}"; do
+        IFS='|' read -r lp proto raddr rport remark mode <<< "$rule"
+        if [[ "$write_mode" == "2" && -n "${exist_ports[$lp]}" ]]; then
+            echo -e "${YELLOW}  ↷ 端口 ${lp} 在 Realm 侧已存在，跳过${NC}"
+            ((skipped++))
+            continue
+        fi
+
+        listen_addr=$(_mode_to_listen "$mode" "$lp")
+        remote_full=$(_join_remote "$raddr" "$rport")
+
+        cat >> "$CONFIG_FILE" <<EOF
+
+[[endpoints]]
+# 备注: ${remark}
+listen = "${listen_addr}"
+remote = "${remote_full}"
+EOF
+        ((added++))
+    done
+
+    # ---- 启动 Realm ----
+    local realm_ok=false
+    if [[ -x "$REALM_DIR/realm" && -f "$SERVICE_FILE" ]]; then
+        echo -e "${CYAN}正在启动 Realm 服务...${NC}"
+        systemctl unmask realm.service &>/dev/null
+        systemctl daemon-reload
+        systemctl restart realm.service
+        systemctl enable realm.service &>/dev/null
+        sleep 1
+        if systemctl is-active --quiet realm 2>/dev/null; then
+            realm_ok=true
+            echo -e "${GREEN}✓ Realm 服务已启动${NC}"
+        else
+            echo -e "${RED}✖ Realm 服务启动失败，配置可能存在问题${NC}"
+            echo -e "${CYAN}  排查: journalctl -u realm -n 30 --no-pager${NC}"
+        fi
+    else
+        echo -e "${YELLOW}⚠ Realm 未安装，规则已写入配置文件，安装后即可生效${NC}"
+    fi
+
+    # Realm 未能接管时保留 iptables，避免转发中断
+    if ! $realm_ok && [[ "$src_action" != "3" ]]; then
+        echo -e "${YELLOW}⚠ Realm 未成功接管转发，已自动保留 iptables 规则以免中断${NC}"
+        echo -e "${CYAN}  Realm 正常后可回到本菜单再次执行切换，或使用备份回滚${NC}"
+        src_action=3
+    fi
+
+    case "$src_action" in
+        1)
+            _stop_iptables_forward
+            _write_iptables_rules_header
+            update_iptables_apply_script
+            echo -e "${GREEN}✓ iptables 转发已停用，规则文件已清空${NC}"
+            ;;
+        2)
+            _stop_iptables_forward
+            echo -e "${GREEN}✓ iptables 转发已停用，规则文件保留（可随时切回）${NC}"
+            ;;
+        3)
+            echo -e "${YELLOW}⚠ iptables 规则仍然生效${NC}"
+            ;;
+    esac
+
+    log "转发方式切换: iptables → Realm，写入 ${added} 条，跳过 ${skipped} 条"
+    echo -e "\n${GREEN}✔ 迁移完成：写入 ${added} 条规则${NC}"
+    (( skipped > 0 )) && echo -e "${YELLOW}  跳过 ${skipped} 条（端口冲突）${NC}"
+}
+
+# ----------------------------------------
+# 规则对照 / 冲突检查
+# ----------------------------------------
+show_forward_comparison() {
+    echo -e "\n${CYAN}══════════ 两种转发方式规则对照 ══════════${NC}"
+
+    local -A realm_ports=()
+    local -A ipt_ports=()
+    local rule lp
+
+    parse_realm_rules
+    local realm_snapshot=("${SWITCH_RULES[@]}")
+    for rule in "${realm_snapshot[@]}"; do
+        IFS='|' read -r lp _ <<< "$rule"
+        realm_ports["$lp"]=1
+    done
+
+    parse_iptables_rules
+    local ipt_snapshot=("${SWITCH_RULES[@]}")
+    for rule in "${ipt_snapshot[@]}"; do
+        IFS='|' read -r lp _ <<< "$rule"
+        ipt_ports["$lp"]=1
+    done
+
+    echo -e "\n${YELLOW}▍Realm 规则（${#realm_snapshot[@]} 条）${NC}"
+    if [[ ${#realm_snapshot[@]} -gt 0 ]]; then
+        SWITCH_RULES=("${realm_snapshot[@]}")
+        _preview_switch_rules realm
+    else
+        echo -e "  ${CYAN}（无）${NC}"
+    fi
+
+    echo -e "\n${YELLOW}▍iptables 规则（${#ipt_snapshot[@]} 条）${NC}"
+    if [[ ${#ipt_snapshot[@]} -gt 0 ]]; then
+        SWITCH_RULES=("${ipt_snapshot[@]}")
+        _preview_switch_rules iptables
+    else
+        echo -e "  ${CYAN}（无）${NC}"
+    fi
+
+    # 端口冲突检查
+    local conflicts=()
+    for lp in "${!realm_ports[@]}"; do
+        [[ -n "${ipt_ports[$lp]}" ]] && conflicts+=("$lp")
+    done
+
+    echo -e ""
+    if [[ ${#conflicts[@]} -gt 0 ]]; then
+        local sorted
+        sorted=$(printf '%s\n' "${conflicts[@]}" | sort -n | tr '\n' ' ')
+        echo -e "${YELLOW}⚠ 以下本地端口在两种方式中同时存在: ${RED}${sorted}${NC}"
+        echo -e "${CYAN}  iptables 的 DNAT 发生在 PREROUTING，优先级高于 Realm 的本地监听，${NC}"
+        echo -e "${CYAN}  两者同时生效时流量会被 iptables 接管。建议只保留一种。${NC}"
+    else
+        echo -e "${GREEN}✓ 未发现两种方式之间的端口冲突${NC}"
+    fi
+}
+
+# ----------------------------------------
+# 回滚到切换前状态
+# ----------------------------------------
+restore_switch_backup() {
+    echo -e "\n${CYAN}══════════ 切换备份回滚 ══════════${NC}"
+
+    local backups=()
+    mapfile -t backups < <(ls -1dt "${SWITCH_BACKUP_DIR}"/*/ 2>/dev/null)
+
+    if [[ ${#backups[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}暂无切换备份${NC}"
+        echo -e "${CYAN}备份目录: ${SWITCH_BACKUP_DIR}${NC}"
+        return
+    fi
+
+    echo -e ""
+    printf "${YELLOW}%-5s %-22s %-18s %s${NC}\n" "序号" "时间" "方向" "规则数(Realm/iptables)"
+    echo -e "${BLUE}────────────────────────────────────────────────────────────────────${NC}"
+
+    local i=1 b meta dir_time direction rc ic dir_str
+    for b in "${backups[@]}"; do
+        meta="${b}meta.conf"
+        dir_time=$(_meta_get "$meta" "time")
+        direction=$(_meta_get "$meta" "direction")
+        rc=$(_meta_get "$meta" "realm_rules")
+        ic=$(_meta_get "$meta" "iptables_rules")
+        case "$direction" in
+            realm2iptables) dir_str="Realm ➜ iptables" ;;
+            iptables2realm) dir_str="iptables ➜ Realm" ;;
+            *) dir_str="${direction:-未知}" ;;
+        esac
+        printf "%-5s %-22s %-18s %s\n" " $i" "${dir_time:-未知}" "$dir_str" "${rc:-0} / ${ic:-0}"
+        ((i++))
+    done
+    echo -e "${BLUE}────────────────────────────────────────────────────────────────────${NC}"
+    echo -e "${CYAN}回滚将恢复该次切换前的规则文件与服务状态${NC}"
+    echo -e ""
+
+    read -rp "请输入要回滚的备份序号（回车返回）: " choice
+    [[ -z "$choice" ]] && { echo "返回。"; return; }
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#backups[@]} )); then
+        echo -e "${RED}✖ 无效序号${NC}"
+        return
+    fi
+
+    local target="${backups[$((choice-1))]}"
+    read -rp "确认回滚到该备份？当前规则将被覆盖 (y/N): " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && { echo "已取消。"; return; }
+
+    # 回滚前再存一份当前状态，避免误操作无法挽回
+    _create_switch_backup "rollback" >/dev/null
+
+    local meta_file="${target}meta.conf"
+    local was_realm_active was_realm_enabled was_chain was_ipt_enabled
+    was_realm_active=$(_meta_get "$meta_file" "realm_active")
+    was_realm_enabled=$(_meta_get "$meta_file" "realm_enabled")
+    was_chain=$(_meta_get "$meta_file" "iptables_chain")
+    was_ipt_enabled=$(_meta_get "$meta_file" "iptables_enabled")
+
+    if [[ -f "${target}config.toml" ]]; then
+        mkdir -p "$REALM_DIR"
+        cp "${target}config.toml" "$CONFIG_FILE"
+        echo -e "${GREEN}✓ 已恢复 Realm 配置${NC}"
+    fi
+    if [[ -f "${target}rules.conf" ]]; then
+        mkdir -p "$IPTABLES_DIR"
+        cp "${target}rules.conf" "$IPTABLES_RULES_FILE"
+        echo -e "${GREEN}✓ 已恢复 iptables 规则文件${NC}"
+    fi
+
+    # 恢复 iptables 生效状态
+    if command -v iptables &>/dev/null; then
+        if [[ "${was_chain:-0}" =~ ^[0-9]+$ ]] && (( was_chain > 0 )); then
+            echo -e "${CYAN}正在重新应用 iptables 规则...${NC}"
+            apply_all_iptables_rules
+            [[ "$was_ipt_enabled" == "enabled" ]] && systemctl enable iptables-forward &>/dev/null
+        else
+            _stop_iptables_forward
+        fi
+    fi
+
+    # 恢复 Realm 服务状态
+    if [[ -x "$REALM_DIR/realm" && -f "$SERVICE_FILE" ]]; then
+        systemctl daemon-reload
+        if [[ "$was_realm_active" == "active" ]]; then
+            systemctl unmask realm.service &>/dev/null
+            systemctl restart realm.service
+            [[ "$was_realm_enabled" == "enabled" ]] && systemctl enable realm.service &>/dev/null
+            sleep 1
+            if systemctl is-active --quiet realm 2>/dev/null; then
+                echo -e "${GREEN}✓ Realm 服务已恢复运行${NC}"
+            else
+                echo -e "${RED}✖ Realm 服务恢复失败，请检查: journalctl -u realm -n 30 --no-pager${NC}"
+            fi
+        else
+            systemctl stop realm 2>/dev/null
+            [[ "$was_realm_enabled" != "enabled" ]] && systemctl disable realm 2>/dev/null
+            echo -e "${CYAN}✓ Realm 服务保持停止（与备份时一致）${NC}"
+        fi
+    fi
+
+    log "已回滚到切换备份: ${target}"
+    echo -e "\n${GREEN}✔ 回滚完成${NC}"
+}
+
+# ----------------------------------------
+# 转发方式切换菜单
+# ----------------------------------------
+switch_mode_menu() {
+    while true; do
+        clear
+
+        local realm_rules ipt_rules chain_rules
+        realm_rules=$(_realm_rule_count)
+        ipt_rules=$(_iptables_rule_count)
+        chain_rules=$(_iptables_chain_count)
+
+        local realm_state ipt_state current_mode
+        if systemctl is-active --quiet realm 2>/dev/null; then
+            realm_state="${GREEN}● 运行中${NC}"
+        elif [[ -x "$REALM_DIR/realm" ]]; then
+            realm_state="${YELLOW}○ 已停止${NC}"
+        else
+            realm_state="${RED}✗ 未安装${NC}"
+        fi
+
+        if (( chain_rules > 0 )); then
+            ipt_state="${GREEN}● 生效中${NC}"
+        elif command -v iptables &>/dev/null; then
+            ipt_state="${YELLOW}○ 未生效${NC}"
+        else
+            ipt_state="${RED}✗ 不可用${NC}"
+        fi
+
+        local realm_on=false ipt_on=false
+        systemctl is-active --quiet realm 2>/dev/null && realm_on=true
+        (( chain_rules > 0 )) && ipt_on=true
+
+        if $realm_on && $ipt_on; then
+            current_mode="${YELLOW}Realm + iptables 同时启用（⚠ 端口重叠时 iptables 优先）${NC}"
+        elif $realm_on; then
+            current_mode="${GREEN}Realm${NC}"
+        elif $ipt_on; then
+            current_mode="${GREEN}iptables${NC}"
+        else
+            current_mode="${YELLOW}均未启用${NC}"
+        fi
+
+        echo -e ""
+        echo -e "${CYAN}    ┌─────────────────────────────────────────┐${NC}"
+        echo -e "${CYAN}    │      转发方式切换 (Realm ⇄ iptables)    │${NC}"
+        echo -e "${CYAN}    └─────────────────────────────────────────┘${NC}"
+        echo -e ""
+        echo -e "    ${CYAN}◈${NC} Realm    : ${realm_state}   规则 ${GREEN}${realm_rules}${NC} 条"
+        echo -e "    ${CYAN}◈${NC} iptables : ${ipt_state}   规则 ${GREEN}${ipt_rules}${NC} 条  /  NAT 条目 ${GREEN}${chain_rules}${NC} 条"
+        echo -e "    ${CYAN}◈${NC} 当前转发方式: ${current_mode}"
+        echo -e ""
+        echo -e "${BLUE}    ┌──────────────────────────────────────────┐${NC}"
+        echo -e "${BLUE}    │${NC}  ${GREEN}[1]${NC} ➜  Realm 规则迁移到 iptables         ${BLUE}│${NC}"
+        echo -e "${BLUE}    │${NC}  ${GREEN}[2]${NC} ➜  iptables 规则迁移到 Realm         ${BLUE}│${NC}"
+        echo -e "${BLUE}    ├──────────────────────────────────────────┤${NC}"
+        echo -e "${BLUE}    │${NC}  ${GREEN}[3]${NC} 📊 规则对照 / 端口冲突检查            ${BLUE}│${NC}"
+        echo -e "${BLUE}    │${NC}  ${YELLOW}[4]${NC} ⏪ 回滚到切换前状态                   ${BLUE}│${NC}"
+        echo -e "${BLUE}    ├──────────────────────────────────────────┤${NC}"
+        echo -e "${BLUE}    │${NC}  ${CYAN}[0]${NC} ←  返回主菜单                         ${BLUE}│${NC}"
+        echo -e "${BLUE}    └──────────────────────────────────────────┘${NC}"
+        echo -e ""
+        echo -ne "    ${CYAN}>>>${NC} 请输入选项: "
+        read -r schoice
+
+        case $schoice in
+            1)
+                switch_realm_to_iptables
+                read -rp "按回车键继续..."
+                ;;
+            2)
+                switch_iptables_to_realm
+                read -rp "按回车键继续..."
+                ;;
+            3)
+                show_forward_comparison
+                read -rp "按回车键继续..."
+                ;;
+            4)
+                restore_switch_backup
                 read -rp "按回车键继续..."
                 ;;
             0) return ;;
@@ -2528,6 +3455,7 @@ main_menu() {
         echo -e "${BLUE}    │${NC}  ${YELLOW}[12]${NC} 📦 配置导入导出                      ${BLUE}│${NC}"
         echo -e "${BLUE}    │${NC}  ${YELLOW}[13]${NC} 🔍 DNS 解析设置                      ${BLUE}│${NC}"
         echo -e "${BLUE}    │${NC}  ${YELLOW}[14]${NC} 🔀 iptables 转发管理                 ${BLUE}│${NC}"
+        echo -e "${BLUE}    │${NC}  ${YELLOW}[15]${NC} 🔁 转发方式切换 (Realm ⇄ iptables)   ${BLUE}│${NC}"
         echo -e "${BLUE}    ├──────────────────────────────────────────┤${NC}"
         echo -e "${BLUE}    │${NC}  ${CYAN}[0]${NC}  ✖  退出脚本                           ${BLUE}│${NC}"
         echo -e "${BLUE}    └──────────────────────────────────────────┘${NC}"
@@ -2557,6 +3485,7 @@ main_menu() {
             12) manage_config ;;
             13) manage_dns ;;
             14) iptables_menu ;;
+            15) switch_mode_menu ;;
             0) exit 0
             ;;
             *) echo -e "${RED}无效选项！${NC}" ;;
