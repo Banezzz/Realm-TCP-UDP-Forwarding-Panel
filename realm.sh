@@ -2,7 +2,7 @@
 # Realm TCP/UDP Forwarding Panel
 set -u
 CURRENT_VERSION="0.5.0"
-PANEL_SHA="4456fd9d5e90c12b5a0a1d20c6615a6078a2ea50699cae5b479ed7614337dd73"
+PANEL_SHA="8390110a9f4aa532c0771ce420755a81f8a8a5b167da16b04ac830020aae1082"
 RAW="https://raw.githubusercontent.com/Banezzz/Realm-TCP-UDP-Forwarding-Panel"
 API="https://api.github.com/repos/Banezzz/Realm-TCP-UDP-Forwarding-Panel"
 REALM_DIR=/root/realm

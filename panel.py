@@ -184,7 +184,8 @@ def validate(doc):
 
 
 def realm_text(doc):
-    runtime = copy.deepcopy(doc)
+    # Render from the persisted representation so a later reload produces identical bytes.
+    runtime = toml.parse(toml.dumps(doc))
     endpoints = runtime.get("endpoints", [])
     for i in reversed(range(len(endpoints))):
         e = endpoints[i]

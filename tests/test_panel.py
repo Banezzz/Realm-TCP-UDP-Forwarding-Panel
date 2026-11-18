@@ -43,6 +43,14 @@ max_ttl = 30
             self.assertEqual(rule["panel_name"], "备注")
             self.assertTrue(p.toml.parse(p.realm_text(doc))["endpoints"][0]["network"]["ipv6_only"])
 
+    def test_mixed_backends_remain_editable_after_reload(self):
+        doc = p.toml.parse(p.EMPTY)
+        for i, b in enumerate(p.BACKENDS):
+            p.add(doc, p.endpoint(b, f"0.0.0.0:{9000 + i}", "192.0.2.1:80", "both"))
+        runtime = p.realm_text(doc)
+        self.assertEqual(runtime, p.realm_text(p.toml.parse(p.toml.dumps(doc))))
+        self.assertEqual(len(p.toml.parse(runtime)["endpoints"]), 1)
+
     def test_protocol_conflicts(self):
         doc = p.toml.parse(p.EMPTY)
         for b, proto in [("realm", "tcp"), ("nftables", "udp")]:
