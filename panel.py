@@ -527,18 +527,28 @@ def recover(j, boot=False):
     for unit, enabled in j["enabled"].items():
         if (UNITS / unit).exists() or enabled:
             service("enable" if enabled else "disable", unit)
-    if j["realm_changed"] and (UNITS / REALM).exists() and not boot:
-        service("restart" if j["active"] else "stop", REALM)
+    if j["realm_changed"] and (UNITS / REALM).exists():
+        if boot:
+            # BOOT is ordered before Realm. Queue the original boot intent without waiting for ourselves.
+            run(["systemctl", "--no-block", "start" if j["enabled"].get(REALM) else "stop", REALM])
+        else:
+            service("restart" if j["active"] else "stop", REALM)
     JOURNAL.unlink()
 
 
-def commit(before, doc, plan, importing=False):
+def commit(before, doc, plan, importing=False, start_existing=False):
     oldplan = json.loads(read(PLAN, "[]"))
     runtime = realm_text(doc)
     had_realm = any(backend(e) == "realm" for e in before.get("endpoints", []))
     has_realm = any(backend(e) == "realm" for e in doc.get("endpoints", []))
-    different = read(CONFIG) != runtime
-    change = (has_realm and (different or not status("is-active", REALM))) or (had_realm and not has_realm)
+    active = status("is-active", REALM)
+    # A firewall-only edit must not restart unrelated connections or wake a deliberately stopped relay.
+    live = read(CONFIG)
+    try:
+        different = live is None or toml.parse(live).unwrap() != toml.parse(runtime).unwrap()
+    except ValueError:
+        different = True
+    change = (has_realm and (different or (start_existing and not active))) or (had_realm and not has_realm)
     if has_realm and (not BIN.is_file() or not (UNITS / REALM).exists()):
         raise ValueError("请先通过菜单 1 安装 Realm，再应用 Realm 规则")
     if STATE.exists() and read(CONFIG) != realm_text(before) and not importing:
@@ -561,7 +571,7 @@ def commit(before, doc, plan, importing=False):
         "xt": xt,
         "nft": nft,
         "legacy": legacy,
-        "active": status("is-active", REALM),
+        "active": active,
         "realm_changed": bool(change),
         "enabled": {u: status("is-enabled", u) for u in units},
         "sysctl": {
@@ -824,12 +834,15 @@ def change_rules(action, args, assume_yes=False, dry_run=False):
         ):
             print("目标规则需要 Realm，正在安装上游完整版")
             install_realm()
-        commit(old, doc, plan, importing=(action == "import"))
+        commit(old, doc, plan, importing=(action == "import"), start_existing=action in ("apply", "import"))
         print("已应用")
 
 
 def fetch(url, proxy=""):
     req = urllib.request.Request(proxy + url, headers={"User-Agent": "Realm-Forwarding-Panel"})
+    token = os.environ.get("GITHUB_TOKEN")
+    if token and not proxy and url.startswith(REPO + "/releases/"):
+        req.add_unredirected_header("Authorization", "Bearer " + token)
     with urllib.request.urlopen(req, timeout=40) as res:
         return res.read()
 

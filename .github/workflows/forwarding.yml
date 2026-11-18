@@ -17,8 +17,10 @@ jobs:
           bash -n realm.sh
           /usr/bin/python3 -m unittest discover -s tests -v
       - name: Install the tested upstream release and exercise systemd
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          sudo ./realm.sh install v2.9.6
+          sudo --preserve-env=GITHUB_TOKEN ./realm.sh install v2.9.6
           cat > "$RUNNER_TEMP/realm.toml" <<'EOF'
           [[endpoints]]
           listen = "127.0.0.1:31031"
