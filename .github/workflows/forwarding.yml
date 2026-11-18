@@ -1,0 +1,37 @@
+name: Forwarding
+on: [push, pull_request]
+permissions:
+  contents: read
+
+jobs:
+  forwarding:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-tomlkit iproute2 iptables nftables
+      - name: Check launcher, configuration and package digest
+        run: |
+          bash -n realm.sh
+          /usr/bin/python3 -m unittest discover -s tests -v
+      - name: Install the tested upstream release and exercise systemd
+        run: |
+          sudo ./realm.sh install v2.9.6
+          cat > "$RUNNER_TEMP/realm.toml" <<'EOF'
+          [[endpoints]]
+          listen = "127.0.0.1:31031"
+          remote = "127.0.0.1:31032"
+          EOF
+          sudo ./realm.sh import "$RUNNER_TEMP/realm.toml" --yes
+          sudo systemctl is-active realm.service
+          sudo ./realm.sh migrate realm nftables --yes
+          sudo systemctl restart realm-panel-nat.service
+          sudo nft list table inet realm_panel
+          sudo ./realm.sh migrate nftables realm --yes
+          sudo systemctl is-active realm.service
+      - name: Test traffic, boot rule replay and rollback
+        run: |
+          sudo /usr/bin/python3 tests/netns.py /root/realm/realm
+          sudo env RFP_TEST_AF=6 /usr/bin/python3 tests/netns.py /root/realm/realm
